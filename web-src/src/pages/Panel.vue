@@ -451,6 +451,12 @@ const diskPct = computed(() => {
   if (!m || !m.disk_total_kb) return 0;
   return pctOf(m.disk_used_kb, m.disk_total_kb);
 });
+// Linux 才有 /proc; Windows 桌面端采不到, 不能显示成 0 装作正常
+const metricsSupported = computed(() => {
+  const m = met.value;
+  return !!m && m.mem_total_kb > 0;
+});
+
 const cpuSpark = computed(() => {
   const h = cpuHist.value;
   if (h.length < 2) return "";
@@ -578,12 +584,15 @@ const filterOptions: { key: FilterKind; label: string }[] = [
         <div class="flex flex-wrap items-center gap-2 p-6 pb-3">
           <div class="text-base font-semibold leading-none tracking-tight">性能</div>
           <span class="text-xs text-muted-foreground">
-            {{ met ? met.cores + " 核 · 已运行 " + fmtUptime(met.uptime_secs) : "采集中…" }}
+            {{ metricsSupported ? met!.cores + " 核 · 已运行 " + fmtUptime(met!.uptime_secs) : met ? "本机不可采集" : "采集中…" }}
           </span>
           <div class="flex-1" />
           <span class="text-xs text-muted-foreground">每 3 秒刷新</span>
         </div>
-        <div class="grid grid-cols-1 gap-3 px-4 pb-4 pt-0 sm:grid-cols-2 md:px-6 md:pb-6">
+        <div v-if="!metricsSupported" class="px-4 pb-4 pt-0 text-xs text-muted-foreground md:px-6 md:pb-6">
+          当前平台不支持采集（性能指标读取的是 Linux 的 /proc；Windows 桌面端请在服务器上查看）
+        </div>
+        <div v-else class="grid grid-cols-1 gap-3 px-4 pb-4 pt-0 sm:grid-cols-2 md:px-6 md:pb-6">
           <div class="rounded-lg border p-3">
             <div class="flex items-center justify-between text-xs">
               <span class="font-medium">CPU</span>

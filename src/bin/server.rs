@@ -77,7 +77,12 @@ fn run_state_path() -> PathBuf {
 
 fn load_config(path: &PathBuf) -> std::io::Result<PanelConfig> {
     match std::fs::read_to_string(path) {
-        Ok(t) => Ok(serde_json::from_str(&t).unwrap_or_default()),
+        // Windows 编辑器/PowerShell 常给 UTF-8 加 BOM, serde_json 不认,
+        // 会静默退化成空配置(表现为"口令丢失"), 这里先剥掉
+        Ok(t) => {
+            let t = t.strip_prefix('\u{feff}').unwrap_or(&t);
+            Ok(serde_json::from_str(t).unwrap_or_default())
+        }
         Err(_) => Ok(PanelConfig::default()),
     }
 }
