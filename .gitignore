@@ -12,3 +12,6 @@ web-src/dist/
 **/cf-api.token
 **/cert.pem
 dist/
+
+# gh CLI 等工具在仓库里留下的运行态
+.local/
