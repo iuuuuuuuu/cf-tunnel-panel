@@ -426,18 +426,21 @@ pub fn parse_df_kb(text: &str) -> Option<(u64, u64)> {
     Some((used, total))
 }
 
+#[cfg(unix)]
 pub fn read_cpu_times() -> Option<(u64, u64)> {
     std::fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|t| parse_proc_stat_cpu(&t))
 }
 
+#[cfg(unix)]
 pub fn read_mem() -> Option<(u64, u64)> {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|t| parse_meminfo(&t))
 }
 
+#[cfg(unix)]
 pub fn read_loadavg() -> Option<(f64, f64, f64)> {
     let t = std::fs::read_to_string("/proc/loadavg").ok()?;
     let f: Vec<f64> = t
@@ -451,17 +454,20 @@ pub fn read_loadavg() -> Option<(f64, f64, f64)> {
     Some((f[0], f[1], f[2]))
 }
 
+#[cfg(unix)]
 pub fn read_uptime_secs() -> Option<f64> {
     let t = std::fs::read_to_string("/proc/uptime").ok()?;
     t.split_whitespace().next()?.parse::<f64>().ok()
 }
 
+#[cfg(unix)]
 pub fn read_net_totals() -> Option<(u64, u64)> {
     std::fs::read_to_string("/proc/net/dev")
         .ok()
         .and_then(|t| parse_net_dev(&t))
 }
 
+#[cfg(unix)]
 pub fn read_self_rss_kb() -> Option<u64> {
     let t = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = t.lines().find(|l| l.starts_with("VmRSS:"))?;
@@ -469,6 +475,7 @@ pub fn read_self_rss_kb() -> Option<u64> {
 }
 
 /// 磁盘用量（KB）：直接调用 df，避免为 statvfs 引入额外依赖。
+#[cfg(unix)]
 pub fn disk_usage(path: &str) -> Option<(u64, u64)> {
     let mut cmd = Command::new("df");
     cmd.args(["-k", path]);
@@ -477,6 +484,143 @@ pub fn disk_usage(path: &str) -> Option<(u64, u64)> {
         return None;
     }
     parse_df_kb(&String::from_utf8_lossy(&out.stdout))
+}
+
+// ------------------------------------------------------------------ Windows 采集
+
+/// Windows 走 Win32：CPU 用 GetSystemTimes，内存 GlobalMemoryStatusEx，
+/// 网卡 GetIfTable2，进程内存 GetProcessMemoryInfo，磁盘 GetDiskFreeSpaceExW。
+#[cfg(windows)]
+mod win {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::SystemInformation::{
+        GetTickCount64, GlobalMemoryStatusEx, MEMORYSTATUSEX,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetSystemTimes};
+
+    const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+
+    fn filetime_u64(ft: &FILETIME) -> u64 {
+        ((ft.dwHighDateTime as u64) << 32) | ft.dwLowDateTime as u64
+    }
+
+    pub fn cpu() -> Option<(u64, u64)> {
+        let zero = FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        };
+        let mut idle = zero;
+        let mut kernel = zero;
+        let mut user = zero;
+        let ok = unsafe { GetSystemTimes(&mut idle, &mut kernel, &mut user) };
+        if ok == 0 {
+            return None;
+        }
+        // GetSystemTimes 的 kernel 时间已包含 idle，总量 = kernel + user
+        Some((filetime_u64(&idle), filetime_u64(&kernel) + filetime_u64(&user)))
+    }
+
+    pub fn mem_kb() -> Option<(u64, u64)> {
+        let mut st: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        st.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let ok = unsafe { GlobalMemoryStatusEx(&mut st) };
+        if ok == 0 {
+            return None;
+        }
+        Some((st.ullTotalPhys / 1024, st.ullAvailPhys / 1024))
+    }
+
+    pub fn uptime_secs() -> Option<f64> {
+        Some(unsafe { GetTickCount64() } as f64 / 1000.0)
+    }
+
+    pub fn net_totals() -> Option<(u64, u64)> {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        let rc = unsafe { GetIfTable2(&mut table) };
+        if rc != 0 || table.is_null() {
+            return None;
+        }
+        let mut rx = 0u64;
+        let mut tx = 0u64;
+        unsafe {
+            let rows = (*table).NumEntries as usize;
+            let base = (*table).Table.as_ptr();
+            for i in 0..rows {
+                let row = &*base.add(i);
+                if row.Type == IF_TYPE_SOFTWARE_LOOPBACK {
+                    continue;
+                }
+                rx = rx.saturating_add(row.InOctets);
+                tx = tx.saturating_add(row.OutOctets);
+            }
+            FreeMibTable(table as *const _);
+        }
+        Some((rx, tx))
+    }
+
+    pub fn self_rss_kb() -> Option<u64> {
+        let mut pmc: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok == 0 {
+            return None;
+        }
+        Some(pmc.WorkingSetSize as u64 / 1024)
+    }
+
+    pub fn disk_kb() -> Option<(u64, u64)> {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let mut root: Vec<u16> = format!("{drive}\\").encode_utf16().collect();
+        root.push(0);
+        let mut free = 0u64;
+        let mut total = 0u64;
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(root.as_ptr(), &mut free, &mut total, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            return None;
+        }
+        Some((total.saturating_sub(free) / 1024, total / 1024))
+    }
+}
+
+#[cfg(windows)]
+pub fn read_cpu_times() -> Option<(u64, u64)> {
+    win::cpu()
+}
+
+#[cfg(windows)]
+pub fn read_mem() -> Option<(u64, u64)> {
+    win::mem_kb()
+}
+
+/// Windows 没有 loadavg 语义，返回 None（界面显示 "-" 而不是编一个数字）
+#[cfg(windows)]
+pub fn read_loadavg() -> Option<(f64, f64, f64)> {
+    None
+}
+
+#[cfg(windows)]
+pub fn read_uptime_secs() -> Option<f64> {
+    win::uptime_secs()
+}
+
+#[cfg(windows)]
+pub fn read_net_totals() -> Option<(u64, u64)> {
+    win::net_totals()
+}
+
+#[cfg(windows)]
+pub fn read_self_rss_kb() -> Option<u64> {
+    win::self_rss_kb()
+}
+
+#[cfg(windows)]
+pub fn disk_usage(_path: &str) -> Option<(u64, u64)> {
+    win::disk_kb()
 }
 
 pub fn cpu_count() -> usize {

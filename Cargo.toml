@@ -21,7 +21,7 @@ required-features = ["server"]
 
 [features]
 default = ["tray"]
-tray = ["dep:tray-icon", "dep:muda", "dep:windows-sys"]
+tray = ["dep:tray-icon", "dep:muda"]
 server = ["dep:tiny_http", "dep:argon2", "dep:rand"]
 
 [dependencies]
@@ -34,7 +34,18 @@ argon2 = { version = "0.5", optional = true }
 rand = { version = "0.8", optional = true }
 tray-icon = { version = "0.25", optional = true }
 muda = { version = "0.20", optional = true }
-windows-sys = { version = "0.59", optional = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_System_SystemInformation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_ProcessStatus",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 strip = true

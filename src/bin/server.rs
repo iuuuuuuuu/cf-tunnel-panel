@@ -980,7 +980,8 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
 
             let (mem_total, mem_avail) = core::read_mem().unwrap_or((0, 0));
             let (disk_used, disk_total) = core::disk_usage("/").unwrap_or((0, 0));
-            let (l1, l5, l15) = core::read_loadavg().unwrap_or((0.0, 0.0, 0.0));
+            // 用 -1 表示"该平台没有 loadavg"，前端据此显示 "-" 而不是假的 0
+            let (l1, l5, l15) = core::read_loadavg().unwrap_or((-1.0, -1.0, -1.0));
             let body = serde_json::json!({
                 "cpu_pct": cpu_pct,
                 "cores": core::cpu_count(),

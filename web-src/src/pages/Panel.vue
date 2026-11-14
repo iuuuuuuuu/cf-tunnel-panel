@@ -635,7 +635,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
               <div class="flex items-center justify-between gap-2">
                 <span class="text-muted-foreground">负载 1/5/15</span>
                 <span class="tabular-nums">
-                  {{ met ? met.load1.toFixed(2) + " / " + met.load5.toFixed(2) + " / " + met.load15.toFixed(2) : "-" }}
+                  {{ met && met.load1 >= 0 ? met.load1.toFixed(2) + " / " + met.load5.toFixed(2) + " / " + met.load15.toFixed(2) : "-" }}
                 </span>
               </div>
               <div class="flex items-center justify-between gap-2">
