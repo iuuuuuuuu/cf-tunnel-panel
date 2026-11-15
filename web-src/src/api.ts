@@ -108,6 +108,10 @@ export const api = {
   setConnection: (settings: ConnectionSettings) => request<{ok: boolean}>('/api/connection', {method:'POST', body:JSON.stringify(settings)}),
   optimize: (input:Optimization) => request<{ok:boolean;output:string;restarted?:boolean}>("/api/optimization/apply",{method:"POST",body:JSON.stringify(input)}),
   state: () => request<State>("/api/state"),
+  ruleBackups: (hostname: string) => request<{ backups: RuleBackup[] }>("/api/rule-backups?hostname=" + encodeURIComponent(hostname)),
+  createRuleBackup: (hostname: string, label: string) => request<{ ok: boolean; backup: RuleBackup }>("/api/rule-backups", { method: "POST", body: JSON.stringify({ hostname, label }) }),
+  restoreRuleBackup: (hostname: string, id: string) => request<{ ok: boolean; requires_save: boolean; restored: RuleBackup }>("/api/rule-backups/restore", { method: "POST", body: JSON.stringify({ hostname, id }) }),
+  deleteRuleBackup: (hostname: string, id: string) => request<{ ok: boolean }>("/api/rule-backups?hostname=" + encodeURIComponent(hostname) + "&id=" + encodeURIComponent(id), { method: "DELETE" }),
   setRules: (rules: RuleInput[]) =>
     request<{ ok: boolean }>("/api/rules", { method: "POST", body: JSON.stringify({ rules }) }),
   setTunnel: (id: string) =>
@@ -149,3 +153,5 @@ export type AlertSettings={thresholds:{cpu_pct:number;memory_pct:number;disk_pct
 export type AlertConfigInput={cpu_pct:number;memory_pct:number;disk_pct:number;pushplus_enabled:boolean;pushplus_token?:string;clear_pushplus_token?:boolean};
 export type ServerDiagnostic={source:'panel-server';server:string;elapsed_ms:number;status:number|null;timing?:{dnsMs:number;connectMs:number;tlsMs:number|null;ttfbMs:number;protocol:string|null}|null;error:string|null;measured:string};
 export type Optimization={action:'connection'|'bypass';confirmed:boolean;settings?:ConnectionSettings;before?:ConnectionSettings;restart?:boolean;hostname?:string;prefix?:string};
+
+export type RuleBackup = { id: string; hostname: string; label: string; created_at: number; rule: { hostname: string; service: string; no_tls_verify: boolean; enabled: boolean; note: string; origin: OriginSettings } };

@@ -34,6 +34,44 @@ const STYLE_CSS: &str = include_str!("../../web/style.css");
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_LOGS: usize = 2000;
+const MAX_BACKUPS: usize = 1000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RuleBackup {
+    id: String,
+    hostname: String,
+    label: String,
+    created_at: u64,
+    rule: core::Rule,
+}
+
+fn backups_path() -> PathBuf {
+    let mut p = config_path();
+    p.set_file_name("rule-backups.json");
+    p
+}
+
+fn load_backups() -> Vec<RuleBackup> {
+    let Ok(text) = std::fs::read_to_string(backups_path()) else { return Vec::new(); };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn save_backups(items: &[RuleBackup]) -> Result<(), String> {
+    let path = backups_path();
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).map_err(|e| e.to_string())?; }
+    let bytes = serde_json::to_vec_pretty(items).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+fn public_backup(item: &RuleBackup) -> serde_json::Value {
+    serde_json::to_value(item).unwrap_or_else(|_| serde_json::json!({}))
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PanelConfig {
@@ -854,6 +892,64 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                 Err(error) => send_json(req, 400, serde_json::json!({"error":error})),
             }
         }
+        (Method::Get, "/api/rule-backups") => {
+            let hostname = req.url().split('?').nth(1).and_then(|query| query.split('&').find_map(|part| {
+                let (key, value) = part.split_once('=')?;
+                (key == "hostname").then(|| value.to_ascii_lowercase())
+            }));
+            let mut items = load_backups();
+            if let Some(host) = hostname { items.retain(|item| item.hostname == host); }
+            items.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            send_json(req, 200, serde_json::json!({"backups": items.iter().map(public_backup).collect::<Vec<_>>() }));
+        }
+        (Method::Post, "/api/rule-backups") => {
+            let value = json_of(&read_body(&mut req));
+            let hostname = value["hostname"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+            let label = value["label"].as_str().unwrap_or("").trim().to_owned();
+            if core::validate_hostname(&hostname).is_err() || label.is_empty() || label.len() > 100 {
+                send_json(req, 400, serde_json::json!({"error":"域名或备份备注不合法"})); return;
+            }
+            let current = st.tunnel.lock().unwrap().rules.iter().find(|rule| rule.hostname == hostname).cloned();
+            let Some(rule) = current else { send_json(req, 404, serde_json::json!({"error":"找不到该转发规则"})); return; };
+            let mut items = load_backups();
+            let backup = RuleBackup { id: rand_hex(12), hostname, label, created_at: now_unix(), rule };
+            items.push(backup.clone());
+            if items.len() > MAX_BACKUPS { items.sort_by(|a,b| b.created_at.cmp(&a.created_at)); items.truncate(MAX_BACKUPS); }
+            match save_backups(&items) {
+                Ok(()) => { st.log(format!("已备份域名 {} 的配置: {}", backup.hostname, backup.label)); send_json(req, 200, serde_json::json!({"ok":true,"backup":public_backup(&backup)})); }
+                Err(error) => send_json(req, 500, serde_json::json!({"error":error})),
+            }
+        }
+        (Method::Post, "/api/rule-backups/restore") => {
+            let value = json_of(&read_body(&mut req));
+            let hostname = value["hostname"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+            let id = value["id"].as_str().unwrap_or("").trim();
+            let Some(backup) = load_backups().into_iter().find(|item| item.hostname == hostname && item.id == id) else {
+                send_json(req, 404, serde_json::json!({"error":"找不到该备份版本"})); return;
+            };
+            if backup.rule.hostname != hostname {
+                send_json(req, 400, serde_json::json!({"error":"备份域名与当前规则不匹配"})); return;
+            }
+            if let Err(error) = backup.rule.origin.validate(&backup.rule.service) { send_json(req, 400, serde_json::json!({"error":error})); return; }
+            let mut tunnel = st.tunnel.lock().unwrap();
+            let Some(current) = tunnel.rules.iter_mut().find(|rule| rule.hostname == hostname) else {
+                send_json(req, 404, serde_json::json!({"error":"当前规则不存在，不能直接恢复"})); return;
+            };
+            *current = backup.rule.clone();
+            let rules = tunnel.rules.clone();
+            let sidecar = core::rules_sidecar(&tunnel.path);
+            if let Err(error) = core::write_rules_sidecar(&sidecar, &rules) { send_json(req, 500, serde_json::json!({"error":error.to_string()})); return; }
+            st.log(format!("已将 {} 恢复到备份 {}；等待保存校验", hostname, backup.label));
+            send_json(req, 200, serde_json::json!({"ok":true,"requires_save":true,"restored":public_backup(&backup)}));
+        }
+        (Method::Delete, "/api/rule-backups") => {
+            let query = req.url().split_once('?').map(|(_, q)| q).unwrap_or("");
+            let mut hostname = String::new(); let mut id = String::new();
+            for part in query.split('&') { let Some((key,value))=part.split_once('=') else {continue}; if key=="hostname" {hostname=value.to_ascii_lowercase()} else if key=="id" {id=value.to_owned()} }
+            let mut items = load_backups(); let before=items.len(); items.retain(|item| !(item.hostname==hostname && item.id==id));
+            if before == items.len() { send_json(req,404,serde_json::json!({"error":"备份不存在"})); return; }
+            match save_backups(&items) { Ok(())=>send_json(req,200,serde_json::json!({"ok":true})), Err(error)=>send_json(req,500,serde_json::json!({"error":error})) }
+        }
         (Method::Post, "/api/optimization/apply") => {
             let input=json_of(&read_body(&mut req));
             if input["confirmed"].as_bool()!=Some(true){send_json(req,400,serde_json::json!({"error":"请先确认变更预览"}));return;}
@@ -1477,6 +1573,27 @@ fn main() {
     }
     for w in workers {
         let _ = w.join();
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+    #[test]
+    fn backup_file_roundtrip_contains_rule_but_no_panel_secret() {
+        let dir=std::env::temp_dir().join(format!("cftp-backup-test-{}",std::process::id()));let _=std::fs::create_dir_all(&dir);
+        let path=dir.join("rule-backups.json");
+        let item=RuleBackup{id:"abc".into(),hostname:"api.example.com".into(),label:"HTTP2 baseline".into(),created_at:123,rule:core::Rule::new("api.example.com",8080)};
+        let bytes=serde_json::to_vec(&vec![item.clone()]).unwrap();std::fs::write(&path,&bytes).unwrap();
+        let loaded:Vec<RuleBackup>=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(loaded[0].label,"HTTP2 baseline");assert_eq!(loaded[0].rule.service,"http://127.0.0.1:8080");
+        let text=String::from_utf8(bytes).unwrap();assert!(!text.contains("password_hash"));assert!(!text.contains("access_token"));assert!(!text.contains("sk-a2a"));
+        let _=std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn backup_limit_keeps_newest_items() {
+        let mut items=Vec::new();for i in 0..(MAX_BACKUPS+5){items.push(RuleBackup{id:i.to_string(),hostname:"a.example.com".into(),label:i.to_string(),created_at:i as u64,rule:core::Rule::new("a.example.com",1)});}
+        items.sort_by(|a,b|b.created_at.cmp(&a.created_at));items.truncate(MAX_BACKUPS);assert_eq!(items.len(),MAX_BACKUPS);assert_eq!(items[0].created_at,MAX_BACKUPS as u64+4);assert!(!items.iter().any(|x|x.id=="0"));
     }
 }
 

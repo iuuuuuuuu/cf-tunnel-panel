@@ -57,6 +57,13 @@ const refreshError = ref('');
 const metricsError = ref('');
 const showDiagnostics = ref(false);
 const pendingDelete = ref('');
+const backupHostname = ref('');
+const backupLabel = ref('');
+const backupItems = ref<import('@/api').RuleBackup[]>([]);
+const backupBusy = ref(false);
+const showBackups = ref(false);
+const pendingRestore = ref<import('@/api').RuleBackup | null>(null);
+const showRestore = ref(false);
 const followLogs = ref(true);
 const logQuery = ref('');
 type FilterKind = "all" | "up" | "down" | "enabled" | "disabled";
@@ -197,6 +204,34 @@ const filtered = computed(() => {
     );
   });
 });
+
+async function openBackups(hostname: string) {
+  backupHostname.value = hostname; backupLabel.value = ''; showBackups.value = true; backupBusy.value = true;
+  try { backupItems.value = (await api.ruleBackups(hostname)).backups; } catch (e: any) { notify(e.message || '读取备份失败', true); }
+  finally { backupBusy.value = false; }
+}
+async function createBackup() {
+  const label = backupLabel.value.trim(); if (!label) { notify('先填写备份备注', true); return; }
+  backupBusy.value = true; try { await api.createRuleBackup(backupHostname.value, label); backupLabel.value = ''; backupItems.value = (await api.ruleBackups(backupHostname.value)).backups; notify('域名配置备份已保存'); } catch (e: any) { notify(e.message || '保存备份失败', true); } finally { backupBusy.value = false; }
+}
+async function restoreBackup() {
+  if (!pendingRestore.value) return; backupBusy.value = true;
+  try { await api.restoreRuleBackup(backupHostname.value, pendingRestore.value.id); pendingRestore.value = null; showRestore.value = false; showBackups.value = false; notify('已恢复备份；请点击“保存并校验”应用配置'); await refresh(); } catch (e: any) { notify(e.message || '恢复失败', true); } finally { backupBusy.value = false; }
+}
+async function deleteBackup(item: import('@/api').RuleBackup) {
+  backupBusy.value = true; try { await api.deleteRuleBackup(item.hostname, item.id); backupItems.value = backupItems.value.filter(x => x.id !== item.id); notify('备份已删除'); } catch (e: any) { notify(e.message || '删除备份失败', true); } finally { backupBusy.value = false; }
+}
+function backupDiff(item: import('@/api').RuleBackup) {
+  const current = rules.value.find(x => x.hostname === item.hostname); if (!current) return [];
+  const rows: [string, string, string][] = [
+    ['目标', current.service, item.rule.service],
+    ['协议校验', current.noTlsVerify ? '跳过' : '校验', item.rule.no_tls_verify ? '跳过' : '校验'],
+    ['状态', current.enabled ? '启用' : '禁用', item.rule.enabled ? '启用' : '禁用'],
+    ['备注', current.note || '—', item.rule.note || '—'],
+  ];
+  const origin = [['连接超时', current.origin.connectTimeout, item.rule.origin.connectTimeout], ['TLS 超时', current.origin.tlsTimeout, item.rule.origin.tlsTimeout], ['TCP 保活', current.origin.tcpKeepAlive, item.rule.origin.tcpKeepAlive], ['空闲连接超时', current.origin.keepAliveTimeout, item.rule.origin.keepAliveTimeout], ['空闲连接数', String(current.origin.keepAliveConnections), String(item.rule.origin.keepAliveConnections)], ['HTTP/2 回源', current.origin.http2Origin ? '启用' : '禁用', item.rule.origin.http2Origin ? '启用' : '禁用'], ['chunked', current.origin.disableChunkedEncoding ? '禁用' : '启用', item.rule.origin.disableChunkedEncoding ? '禁用' : '启用'], ['Host', current.origin.httpHostHeader || '—', item.rule.origin.httpHostHeader || '—'], ['SNI', current.origin.originServerName || '—', item.rule.origin.originServerName || '—']] as [string, string, string][];
+  return [...rows, ...origin].filter(x => x[1] !== x[2]);
+}
 
 function toPayload(r: Rule): RuleInput {
   return {
@@ -653,6 +688,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                 <td class="px-2 py-2.5 align-middle">
                   <div class="flex flex-wrap gap-1">
                     <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的 API 与流式配置'" title="配置此域名的 API / 流式规则" @click="openApi(r.hostname)"><SlidersHorizontal class="h-3.5 w-3.5" /><span>API / 流式</span></Button>
+                    <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的配置备份'" title="配置备份" @click="openBackups(r.hostname)"><Save class="h-3.5 w-3.5"/><span>备份</span></Button>
                     <Button variant="outline" size="icon" title="编辑" @click="openEdit(r)">
                       <Pencil class="h-3.5 w-3.5" />
                     </Button>
@@ -716,6 +752,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                 </button>
                 <div class="flex-1" />
                 <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的 API 与流式配置'" title="配置此域名的 API / 流式规则" @click="openApi(r.hostname)"><SlidersHorizontal class="h-3.5 w-3.5" /><span>API / 流式</span></Button>
+                    <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的配置备份'" title="配置备份" @click="openBackups(r.hostname)"><Save class="h-3.5 w-3.5"/><span>备份</span></Button>
                     <Button variant="outline" size="icon" title="编辑" @click="openEdit(r)">
                   <Pencil class="h-3.5 w-3.5" />
                 </Button>
@@ -751,6 +788,28 @@ const filterOptions: { key: FilterKind; label: string }[] = [
     </main>
     </div>
 
+    <Modal v-model="showBackups" label="域名配置备份" :busy="backupBusy">
+      <div class="flex items-center justify-between">
+        <div><div class="text-base font-semibold">配置备份</div><p class="mt-1 break-all text-xs text-muted-foreground">{{ backupHostname }} · 不含 Token、密码和证书</p></div>
+        <Button variant="ghost" size="icon" aria-label="关闭备份" @click="showBackups = false"><X class="h-4 w-4" /></Button>
+      </div>
+      <div class="mt-5 flex gap-2"><Input v-model="backupLabel" placeholder="例如：HTTP2 默认 / 调大超时" /><Button :disabled="backupBusy" @click="createBackup"><Save class="h-4 w-4" />保存当前版本</Button></div>
+      <p class="mt-2 text-xs leading-relaxed text-muted-foreground">恢复只替换当前面板规则并写入规则清单，不会自动重启；确认后回到总览点“保存并校验”才应用。</p>
+      <div v-if="backupBusy" class="info-strip mt-4">处理中…</div>
+      <div v-else-if="!backupItems.length" class="info-strip mt-4">暂无备份。先保存一个当前版本，之后再调整配置。</div>
+      <div v-else class="mt-4 space-y-3">
+        <article v-for="item in backupItems" :key="item.id" class="rounded-xl border p-4">
+          <div class="flex flex-wrap items-center justify-between gap-2"><div><strong class="text-sm">{{ item.label }}</strong><p class="mt-1 text-xs text-muted-foreground">{{ new Date(item.created_at * 1000).toLocaleString() }}</p></div><Badge variant="muted">{{ item.id.slice(0, 8) }}</Badge></div>
+          <div v-if="backupDiff(item).length" class="mt-3 space-y-1 text-xs"><div v-for="row in backupDiff(item)" :key="row[0]" class="grid grid-cols-[70px_1fr_1fr] gap-2"><span class="text-muted-foreground">{{ row[0] }}</span><span class="break-all">当前：{{ row[1] }}</span><span class="break-all">备份：{{ row[2] }}</span></div></div>
+          <p v-else class="mt-3 text-xs text-muted-foreground">当前规则与此版本一致</p>
+          <div class="mt-3 flex justify-end gap-2"><Button variant="ghost" size="sm" :disabled="backupBusy" @click="deleteBackup(item)">删除</Button><Button variant="outline" size="sm" :disabled="backupBusy" @click="pendingRestore = item; showRestore = true">恢复此版本</Button></div>
+        </article>
+      </div>
+    </Modal>
+
+    <Modal v-model="showRestore" label="恢复域名配置" :busy="backupBusy">
+      <h2 class="text-base font-semibold">确认恢复？</h2><p class="mt-3 text-sm">将 {{ backupHostname }} 恢复到“{{ pendingRestore?.label }}”。当前未保存的规则修改会被替换。</p><p class="mt-3 text-xs leading-relaxed text-muted-foreground">恢复后不会自动重启隧道。请在总览检查差异，再点击“保存并校验”。</p><div class="mt-5 flex justify-end gap-2"><Button variant="outline" @click="showRestore = false; pendingRestore = null">取消</Button><Button :disabled="backupBusy" @click="restoreBackup">确认恢复</Button></div>
+    </Modal>
     <Modal v-model="showForm" label="转发规则" :busy="busy">
           <div class="mb-4 flex items-center justify-between">
             <div class="text-base font-semibold">{{ editing ? "编辑转发规则" : "添加转发规则" }}</div>
