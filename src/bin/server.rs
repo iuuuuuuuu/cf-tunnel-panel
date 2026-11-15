@@ -9,6 +9,7 @@
 //! - 默认只绑 127.0.0.1, 对外请用 nginx 反代并加 limit_req
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::io::Read;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -22,6 +23,10 @@ use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 use cf_tunnel_panel as core;
+#[path = "server/monitoring.rs"]
+mod monitoring;
+#[path = "server/probe.rs"]
+mod probe;
 
 const INDEX_HTML: &str = include_str!("../../web/index.html");
 const APP_JS: &str = include_str!("../../web/app.js");
@@ -41,6 +46,10 @@ struct PanelConfig {
     window_min: u64,
     lock_min: u64,
     trust_proxy: bool,
+    #[serde(default)]
+    active_tunnel_path: Option<PathBuf>,
+    #[serde(default)]
+    tunnel_paths: HashMap<String, PathBuf>,
 }
 
 impl Default for PanelConfig {
@@ -57,6 +66,8 @@ impl Default for PanelConfig {
             window_min: 10,
             lock_min: 15,
             trust_proxy: false,
+            active_tunnel_path: None,
+            tunnel_paths: HashMap::new(),
         }
     }
 }
@@ -174,7 +185,7 @@ fn spawn_tunnel(
     tcfg: &core::TunnelConfig,
 ) -> std::io::Result<()> {
     match core::read_tunnel_token(&tcfg.path) {
-        Some(token) => runner.start_with_token(cf, &token),
+        Some(token) => runner.start_with_token(cf, &token, &tcfg.connection),
         None => runner.start(cf, &tcfg.path),
     }
 }
@@ -251,6 +262,12 @@ struct MetricsPrev {
     tx_bps: f64,
 }
 
+#[derive(Default)]
+struct TunnelListCache {
+    tunnels: Vec<core::TunnelInfo>,
+    error: Option<String>,
+}
+
 struct State {
     cfg: Mutex<PanelConfig>,
     metrics: Mutex<MetricsPrev>,
@@ -262,6 +279,9 @@ struct State {
     cf: Option<PathBuf>,
     /// 连接状态缓存: tunnel info 要走网络, 不能每次请求都算
     conn: Mutex<String>,
+    tunnel_list: Mutex<TunnelListCache>,
+    monitor: Arc<monitoring::Monitor>,
+    external: std::sync::atomic::AtomicBool,
 }
 
 impl State {
@@ -393,7 +413,7 @@ fn security_headers() -> Vec<Header> {
     vec![
         hdr(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            "default-src 'self'; script-src 'self' https://static.cloudflareinsights.com; style-src 'self'; img-src 'self' data:; connect-src 'self' https://cloudflareinsights.com; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
         ),
         hdr("X-Frame-Options", "DENY"),
         hdr("X-Content-Type-Options", "nosniff"),
@@ -562,6 +582,31 @@ fn handle(st: &Arc<State>, req: Request) {
         return;
     }
 
+    // Same-origin frame for visitor-side diagnostics: keep the main panel CSP strict.
+    if method == Method::Get && path == "/api/diagnostics/probe" {
+        let origins = st.tunnel.lock().unwrap().rules.iter()
+            .filter(|rule| core::validate_hostname(&rule.hostname).is_ok())
+            .map(|rule| format!("https://{}", rule.hostname))
+            .collect::<Vec<_>>().join(" ");
+        let policy = format!("default-src 'none'; script-src 'self'; connect-src 'self' {origins}; frame-ancestors 'self'; base-uri 'none'; form-action 'none'");
+        let mut response = Response::from_string("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><title>访问诊断探针</title><script src=\"/api/diagnostics/probe.js\" defer></script></head><body></body></html>");
+        for header in security_headers() {
+            if !header.field.equiv("Content-Security-Policy") && !header.field.equiv("X-Frame-Options") {
+                response.add_header(header);
+            }
+        }
+        response.add_header(hdr("Cache-Control", "no-store, no-transform"));
+        response.add_header(hdr("Content-Type", "text/html; charset=utf-8"));
+        response.add_header(hdr("Content-Security-Policy", &policy));
+        response.add_header(hdr("X-Frame-Options", "SAMEORIGIN"));
+        let _ = req.respond(response);
+        return;
+    }
+    if method == Method::Get && path == "/api/diagnostics/probe.js" {
+        send(req, 200, "application/javascript; charset=utf-8", include_bytes!("../../web/access-probe.js"), vec![]);
+        return;
+    }
+
     if path.starts_with("/api/") {
         let is_write = method != Method::Get;
         if is_write {
@@ -637,9 +682,10 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
     match (method, path) {
         (Method::Get, "/api/state") => {
             let tcfg = st.tunnel.lock().unwrap().clone();
-            let tunnels = match &st.cf {
-                Some(cf) => core::list_tunnels(cf).unwrap_or_default(),
-                None => Vec::new(),
+            // Never run network commands on the request path. Keep the last good list.
+            let (tunnels, tunnels_error) = {
+                let cache = st.tunnel_list.lock().unwrap();
+                (cache.tunnels.clone(), cache.error.clone())
             };
             let rules: Vec<serde_json::Value> = tcfg
                 .rules
@@ -655,6 +701,7 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                         "host": host,
                         "port": port,
                         "noTlsVerify": r.no_tls_verify,
+                        "origin": r.origin,
                         "enabled": r.enabled,
                         "note": r.note,
                         "port_open": open,
@@ -662,7 +709,7 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                 })
                 .collect();
             let running = st.runner.lock().unwrap().running();
-            let external = !running && core::external_running();
+            let external = !running && st.external.load(std::sync::atomic::Ordering::Relaxed);
             let conn = st.conn.lock().unwrap().clone();
             let logs = st.logs.lock().unwrap().clone();
             let tlist: Vec<serde_json::Value> = tunnels
@@ -672,7 +719,9 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
             let body = serde_json::json!({
                 "tunnel": tcfg.tunnel,
                 "tunnels": tlist,
+                "tunnels_error": tunnels_error,
                 "rules": rules,
+                "connection": tcfg.connection,
                 "running": running,
                 "external": external,
                 "conn": conn,
@@ -724,10 +773,16 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                 }
                 let enabled = item.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true);
                 let note = item.get("note").and_then(|x| x.as_str()).unwrap_or("").trim().to_owned();
+                let origin: core::OriginSettings = match serde_json::from_value(item.get("origin").cloned().unwrap_or(serde_json::json!({}))) {
+                    Ok(v) => v,
+                    Err(e) => { send_json(req, 400, serde_json::json!({"error": e.to_string()})); return; }
+                };
+                if let Err(e) = origin.validate(&service) { send_json(req, 400, serde_json::json!({"error": e})); return; }
                 rules.push(core::Rule {
                     hostname: host,
                     service,
                     no_tls_verify: no_tls,
+                    origin,
                     enabled,
                     note,
                 });
@@ -743,19 +798,107 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
             let body = read_body(&mut req);
             let v = json_of(&body);
             let id = v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_owned();
-            if id.is_empty() {
-                send_json(req, 400, serde_json::json!({"error": "缺少隧道 id"}));
+            if id.len() != 36 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+                send_json(req, 400, serde_json::json!({"error": "隧道 id 不合法"}));
                 return;
+            }
+            if st.runner.lock().unwrap().running() {
+                send_json(req, 400, serde_json::json!({"error": "请先停止当前隧道，再切换配置"})); return;
             }
             {
                 let mut t = st.tunnel.lock().unwrap();
-                t.tunnel = id.clone();
-                t.credentials_file = core::cf_dir()
-                    .join(format!("{id}.json"))
-                    .to_string_lossy()
-                    .into_owned();
+                if t.tunnel == id { send_json(req, 200, serde_json::json!({"ok":true})); return; }
+                let known = st.cfg.lock().unwrap().tunnel_paths.get(&id).cloned();
+                let mut next = match core::read_config(&known.unwrap_or_else(|| core::profile_path(&id))) {
+                    Ok(cfg) => cfg,
+                    Err(e) => { send_json(req, 400, serde_json::json!({"error":e.to_string()})); return; }
+                };
+                next.tunnel = id.clone();
+                if next.credentials_file.is_empty() {
+                    next.credentials_file = core::cf_dir().join(format!("{id}.json")).to_string_lossy().into_owned();
+                }
+                if let Some(rules) = core::read_rules_sidecar(&core::rules_sidecar(&next.path)) { next.rules = rules; }
+                if let Err(e) = core::write_config(&next) { send_json(req, 500, serde_json::json!({"error":e.to_string()})); return; }
+                let mut panel = st.cfg.lock().unwrap();
+                let mut updated = panel.clone();
+                if !t.tunnel.is_empty() { updated.tunnel_paths.insert(t.tunnel.clone(), t.path.clone()); }
+                updated.tunnel_paths.insert(id.clone(), next.path.clone());
+                updated.active_tunnel_path = Some(next.path.clone());
+                if let Err(e) = save_config(&config_path(), &updated) { send_json(req, 500, serde_json::json!({"error":e.to_string()})); return; }
+                *panel = updated;
+                *t = next;
             }
             st.log(format!("已切换到隧道 {id}"));
+            send_json(req, 200, serde_json::json!({"ok": true}));
+        }
+        (Method::Post, "/api/cloud") => {
+            let body = read_body(&mut req);
+            let v = json_of(&body);
+            let hostname = v["hostname"].as_str().unwrap_or("").trim().to_ascii_lowercase();
+            let Some(token) = core::read_token() else {
+                send_json(req, 400, serde_json::json!({"error":"请先配置 Cloudflare API Token"})); return;
+            };
+            let result = match v["action"].as_str().unwrap_or("") {
+                "read" => core::zone_settings(&token, &hostname),
+                "setting" => core::update_zone_setting(&token, &hostname, v["setting"].as_str().unwrap_or(""), v["value"].as_str().unwrap_or(""))
+                    .map(|_| serde_json::json!({"ok":true})),
+                "cache" => core::apply_cache_bypass(&token, &hostname, v["prefix"].as_str().unwrap_or(""))
+                    .map(|_| serde_json::json!({"ok":true})),
+                "configuration" => core::apply_configuration_rule(&token, &hostname, v["prefix"].as_str().unwrap_or(""),
+                    v["request"].as_str().unwrap_or(""), v["response"].as_str().unwrap_or(""), v["rocket"].as_str().unwrap_or(""))
+                    .map(|_| serde_json::json!({"ok":true})),
+                _ => Err("不支持的云端操作".into()),
+            };
+            match result {
+                Ok(value) => send_json(req, 200, value),
+                Err(error) => send_json(req, 400, serde_json::json!({"error":error})),
+            }
+        }
+        (Method::Post, "/api/optimization/apply") => {
+            let input=json_of(&read_body(&mut req));
+            if input["confirmed"].as_bool()!=Some(true){send_json(req,400,serde_json::json!({"error":"请先确认变更预览"}));return;}
+            let action=input["action"].as_str().unwrap_or("");
+            if action=="connection" {
+                let settings:core::ConnectionSettings=match serde_json::from_value(input["settings"].clone()){Ok(v)=>v,Err(_)=>{send_json(req,400,serde_json::json!({"error":"连接参数不合法"}));return;}};
+                if let Err(e)=settings.validate(){send_json(req,400,serde_json::json!({"error":e}));return;}
+                let mut tunnel=st.tunnel.lock().unwrap();
+                if input["before"]!=serde_json::to_value(&tunnel.connection).unwrap(){send_json(req,409,serde_json::json!({"error":"连接配置已变化，请刷新后重新预览"}));return;}
+                let restart=input["restart"].as_bool().unwrap_or(false);
+                let mut runner=st.runner.lock().unwrap();
+                let running=runner.running();
+                if restart && !running && st.external.load(std::sync::atomic::Ordering::Relaxed){send_json(req,409,serde_json::json!({"error":"连接器由外部进程运行，面板不能替它重启。可仅保存后手动应用。"}));return;}
+                let old=tunnel.connection.clone();
+                if let Err(e)=core::write_connection_settings(&tunnel.path,&settings){send_json(req,500,serde_json::json!({"error":e.to_string()}));return;}
+                let Some(cf)=st.cf.as_ref() else {let _=core::write_connection_settings(&tunnel.path,&old);send_json(req,400,serde_json::json!({"error":"未找到 cloudflared，未应用变更"}));return;};
+                match core::validate_config(cf,&tunnel.path) {
+                    Ok((true,_))=>{},
+                    _=>{let _=core::write_connection_settings(&tunnel.path,&old);send_json(req,400,serde_json::json!({"error":"cloudflared 校验未通过，连接参数已还原"}));return;}
+                }
+                tunnel.connection=settings;
+                if restart&&running {runner.stop();if let Err(e)=spawn_tunnel(&mut runner,cf,&tunnel){let _=core::write_connection_settings(&tunnel.path,&old);tunnel.connection=old;let recovered=spawn_tunnel(&mut runner,cf,&tunnel).is_ok();send_json(req,500,serde_json::json!({"error":format!("新连接启动失败: {e}；已还原配置，旧配置重启{}",if recovered{"成功"}else{"失败，请手动启动"})}));return;}}
+                let output=if restart&&running {"连接参数已校验、保存并重启；请同一网络再次检测"}else{"连接参数已校验并保存；下次启动/手动重启生效"};
+                st.log(output);send_json(req,200,serde_json::json!({"ok":true,"output":output,"restarted":restart&&running}));
+            } else if action=="bypass" {
+                let host=input["hostname"].as_str().unwrap_or("");let prefix=input["prefix"].as_str().unwrap_or("");
+                if !st.tunnel.lock().unwrap().rules.iter().any(|r|r.hostname==host&&r.enabled){send_json(req,400,serde_json::json!({"error":"目标不是当前已启用规则"}));return;}
+                let Some(token)=core::read_token()else{send_json(req,400,serde_json::json!({"error":"请先配置有 Cache Rules Edit / Zone Read 权限的 Cloudflare Token"}));return;};
+                match core::apply_cache_bypass(&token,host,prefix){Ok(())=>send_json(req,200,serde_json::json!({"ok":true,"output":"Cloudflare 已确认此路径的缓存绕过规则；不会修改源站缓冲，不保证延迟降低"})),Err(e)=>send_json(req,400,serde_json::json!({"error":e}))}
+            } else {send_json(req,400,serde_json::json!({"error":"不支持的优化类型"}));}
+        }
+        (Method::Post, "/api/connection") => {
+            let body = read_body(&mut req);
+            let settings: core::ConnectionSettings = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(e) => { send_json(req, 400, serde_json::json!({"error": e.to_string()})); return; }
+            };
+            if let Err(e) = settings.validate() { send_json(req, 400, serde_json::json!({"error": e})); return; }
+            let mut cfg = st.tunnel.lock().unwrap();
+            let mut candidate = cfg.clone();
+            candidate.connection = settings;
+            if let Err(e) = core::write_connection_settings(&candidate.path, &candidate.connection) {
+                send_json(req, 500, serde_json::json!({"error": e.to_string()})); return;
+            }
+            *cfg = candidate;
             send_json(req, 200, serde_json::json!({"ok": true}));
         }
         (Method::Post, "/api/save") => {
@@ -830,7 +973,7 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                 return;
             };
             let tcfg = st.tunnel.lock().unwrap().clone();
-            if tcfg.rules.is_empty() {
+            if tcfg.rules.is_empty() && core::read_tunnel_token(&tcfg.path).is_none() {
                 send_json(req, 400, serde_json::json!({"error": "还没有规则"}));
                 return;
             }
@@ -944,6 +1087,18 @@ fn handle_api(st: &Arc<State>, mut req: Request, path: &str, method: &Method, cs
                 st.log(format!("DNS {m}"));
             }
             send_json(req, 200, serde_json::json!({"ok": true, "messages": msgs}));
+        }
+        (_, "/api/metrics/history" | "/api/alerts" | "/api/alerts/config" | "/api/alerts/test") => st.monitor.handle(req,path,method),
+        (Method::Post, "/api/diagnostics/server") => {
+            let input=json_of(&read_body(&mut req));
+            let target=input["url"].as_str().unwrap_or("");
+            let timeout=input["timeout_ms"].as_u64().unwrap_or(10000).clamp(1000,20000);
+            let parsed=match url::Url::parse(target) {Ok(url)=>url,Err(_)=>{send_json(req,400,serde_json::json!({"error":"URL 无效"}));return;}};
+            let host=parsed.host_str().unwrap_or("");
+            if parsed.scheme()!="https"||parsed.port().is_some()||!parsed.username().is_empty()||parsed.password().is_some()||parsed.query().is_some()||parsed.fragment().is_some()||!st.tunnel.lock().unwrap().rules.iter().any(|r|r.hostname==host) {
+                send_json(req,400,serde_json::json!({"error":"只允许当前规则的 HTTPS 公网域名与不含查询参数的只读路径"}));return;
+            }
+            send_json(req,200,probe::sample(parsed.as_str(),timeout));
         }
         (Method::Get, "/api/metrics") => {
             let now = std::time::Instant::now();
@@ -1151,9 +1306,9 @@ fn main() {
     if cf.is_none() {
         eprintln!("警告: 没找到 cloudflared, 面板能打开但无法启动隧道");
     }
-    let tunnel_path = std::env::var("TUNNEL_CONFIG")
+    let tunnel_path = cfg.active_tunnel_path.clone().unwrap_or_else(|| std::env::var("TUNNEL_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| core::cf_dir().join("agent2api-pc.yml"));
+        .unwrap_or_else(|_| core::cf_dir().join("agent2api-pc.yml")));
     let mut tunnel = core::read_config(&tunnel_path).unwrap_or_default();
     let sidecar = core::rules_sidecar(&tunnel_path);
     match core::read_rules_sidecar(&sidecar) {
@@ -1167,6 +1322,7 @@ fn main() {
         }
     }
 
+    let monitor=monitoring::Monitor::new(&cfg_path).unwrap_or_else(|e| { eprintln!("监控初始化失败: {e}"); std::process::exit(1) });
     let st = Arc::new(State {
         cfg: Mutex::new(cfg.clone()),
         sessions: Mutex::new(load_sessions_from(&sessions_path(), ttl_secs_from(&cfg))),
@@ -1177,12 +1333,19 @@ fn main() {
         logs: Mutex::new(Vec::new()),
         cf,
         conn: Mutex::new(String::new()),
+        tunnel_list: Mutex::new(TunnelListCache::default()),
+        monitor,
+        external: std::sync::atomic::AtomicBool::new(false),
     });
 
+
+    st.monitor.start(&st);
+
     // 按上次状态恢复隧道（面板重启或机器重启后自动拉起）
+
     if core::read_run_state(&run_state_path()) {
         let tcfg = st.tunnel.lock().unwrap().clone();
-        let can = st.cf.is_some() && !tcfg.rules.is_empty() && !core::external_running();
+        let can = st.cf.is_some() && (!tcfg.rules.is_empty() || core::read_tunnel_token(&tcfg.path).is_some()) && !core::external_running();
         if can {
             let cf = st.cf.clone().unwrap();
             let mut runner = st.runner.lock().unwrap();
@@ -1193,6 +1356,30 @@ fn main() {
         } else {
             st.log("上次为运行状态，但缺少 cloudflared / 规则 / 已有外部进程，跳过自动启动");
         }
+    }
+
+
+    // Never hold the cache lock while querying Cloudflare.
+    {
+        let st = st.clone();
+        std::thread::spawn(move || loop {
+            if let Some(cf) = &st.cf {
+                let result = core::list_tunnels(cf);
+                let mut cache = st.tunnel_list.lock().unwrap();
+                match result {
+                    Ok(tunnels) => { cache.tunnels = tunnels; cache.error = None; }
+                    Err(error) => { cache.error = Some(format!("隧道列表更新失败: {error}")); }
+                }
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        });
+    }
+    {
+        let st = st.clone();
+        std::thread::spawn(move || loop {
+            st.external.store(core::external_running(), std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Duration::from_secs(3));
+        });
     }
 
     // 日志搬运: cloudflared 输出 -> 面板日志缓冲

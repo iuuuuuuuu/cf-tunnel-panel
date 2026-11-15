@@ -15,3 +15,8 @@ dist/
 
 # gh CLI 等工具在仓库里留下的运行态
 .local/
+
+# Runtime monitoring and credentials
+**/monitoring/
+**/pushplus.token
+**/panel-desktop-password.txt

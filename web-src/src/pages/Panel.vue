@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
-import { api, setCsrf, type Metrics, type Rule, type RuleInput, type State, type ScannedService } from "@/api";
+import { api, defaultOrigin, setCsrf, type Metrics, type MetricsSample, type Rule, type RuleInput, type State, type ScannedService } from "@/api";
 import Badge from "@/components/ui/Badge.vue";
 import Button from "@/components/ui/Button.vue";
 import Card from "@/components/ui/Card.vue";
@@ -9,14 +9,12 @@ import Label from "@/components/ui/Label.vue";
 import {
   ArrowDown,
   ArrowUp,
-  ChevronDown,
   CloudUpload,
   Copy,
   ExternalLink,
   KeyRound,
   Loader2,
   LogOut,
-  Moon,
   Pencil,
   Play,
   Plus,
@@ -24,17 +22,49 @@ import {
   Save,
   Search,
   Square,
-  Sun,
   Trash2,
   X,
 } from "lucide-vue-next";
 
+import Modal from '@/components/ui/Modal.vue';
+import ThemePicker from '@/components/ui/ThemePicker.vue';
+import Select from '@/components/ui/Select.vue';
+import Switch from '@/components/ui/Switch.vue';
+import OriginFields from '@/components/OriginFields.vue';
+import ConnectionSettings from '@/components/ConnectionSettings.vue';
+import ApiToolkit from '@/components/ApiToolkit.vue';
+import PerformanceOverview from '@/components/PerformanceOverview.vue';
+import AccessDiagnostics from '@/components/AccessDiagnostics.vue';
+import MonitoringCenter from '@/components/MonitoringCenter.vue';
+import { Activity, Network, SlidersHorizontal, Terminal, Globe } from 'lucide-vue-next';
+const section = ref('routes');
+const apiHostname = ref('');
+async function openApi(hostname: string) {
+  apiHostname.value = hostname;
+  section.value = 'api';
+  await nextTick();
+  window.scrollTo({top: 0, behavior: 'instant'});
+}
+const sections = [
+  { id: 'routes', label: '总览与规则', short: '首页', icon: Network, subtitle: '服务连接与主机状态，一眼掌握。' },
+  { id: 'connection', label: '连接设置', short: '连接', icon: SlidersHorizontal, subtitle: '按网络环境调整协议与连接方式。' },
+  { id: 'api', label: 'API 与流式优化', short: 'API', icon: Globe, subtitle: '管理缓存策略，让流式响应保持顺畅。' },
+  { id: 'metrics', label: '运行监控', short: '监控', icon: Activity, subtitle: '主机资源、实时流量与运行状态。' },
+  { id: 'logs', label: '连接日志', short: '日志', icon: Terminal, subtitle: '查看连接事件与回源日志。' },
+];
+const currentSection = computed(() => sections.find(s => s.id === section.value)!);
+const refreshError = ref('');
+const metricsError = ref('');
+const showDiagnostics = ref(false);
+const pendingDelete = ref('');
+const followLogs = ref(true);
+const logQuery = ref('');
 type FilterKind = "all" | "up" | "down" | "enabled" | "disabled";
 
 const state = ref<State | null>(null);
 const busy = ref(false);
 const toast = ref<{ text: string; bad: boolean } | null>(null);
-const theme = ref<"light" | "dark">("light");
+
 const query = ref("");
 const flt = ref<FilterKind>("all");
 const logLimit = ref(200);
@@ -50,13 +80,14 @@ const scanning = ref(false);
 const scanned = ref<ScannedService[]>([]);
 const logEl = ref<HTMLPreElement | null>(null);
 const met = ref<Metrics | null>(null);
-const cpuHist = ref<number[]>([]);
+const cpuHist = ref<Partial<MetricsSample>[]>([]);
 
 const form = ref({
   hostname: "",
   port: "",
   host: "127.0.0.1",
   scheme: "http",
+  origin: defaultOrigin(),
   noTlsVerify: false,
   enabled: true,
   note: "",
@@ -69,48 +100,47 @@ let dragIndex = -1;
 function notify(text: string, bad = false) {
   toast.value = { text, bad };
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => (toast.value = null), 3200);
+  toastTimer = window.setTimeout(() => (toast.value = null), bad ? 8000 : 6000);
 }
 
-function applyTheme(next: "light" | "dark") {
-  theme.value = next;
-  document.documentElement.classList.toggle("dark", next === "dark");
-  window.localStorage.setItem("cftheme", next);
-}
-
-function initTheme() {
-  const saved = window.localStorage.getItem("cftheme");
-  if (saved === "light" || saved === "dark") {
-    applyTheme(saved);
-    return;
-  }
-  applyTheme(window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-}
-
-function toggleTheme() {
-  applyTheme(theme.value === "dark" ? "light" : "dark");
-}
-
-async function refresh() {
+let refreshing = false;
+let refreshingMetrics = false;
+async function refreshState() {
+  if (refreshing) return;
+  refreshing = true;
   try {
     const st = await api.state();
     setCsrf(st.csrf);
     state.value = st;
-    const m = await api.metrics();
-    met.value = m;
-    const next = cpuHist.value.concat([Math.round(m.cpu_pct)]);
-    cpuHist.value = next.length > 60 ? next.slice(next.length - 60) : next;
-  } catch (e) {
-    /* 401 已由 api 跳转 */
+    refreshError.value = '';
+  } catch {
+    refreshError.value = '连接状态刷新失败，正在显示上次数据。';
+  } finally {
+    refreshing = false;
   }
 }
-
+async function refreshMetrics() {
+  if (refreshingMetrics) return;
+  refreshingMetrics = true;
+  try {
+    const m = await api.metrics();
+    met.value = m;
+    cpuHist.value = [...cpuHist.value, {at:Date.now()/1000,cpu_pct:m.cpu_pct}].slice(-60);
+    metricsError.value = '';
+  } catch {
+    metricsError.value = '监控更新失败，正在显示上次数据。';
+  } finally {
+    refreshingMetrics = false;
+  }
+}
+async function refresh() {
+  await Promise.all([refreshState(), refreshMetrics()]);
+}
 onMounted(() => {
-  initTheme();
   refresh();
   pollTimer = window.setInterval(refresh, 3000);
 });
-onUnmounted(() => window.clearInterval(pollTimer));
+onUnmounted(() => { window.clearInterval(pollTimer); window.clearTimeout(toastTimer); });
 
 async function guard(fn: () => Promise<void>, ok: string) {
   if (busy.value) {
@@ -134,7 +164,7 @@ const running = computed(() => !!state.value?.running);
 const tunnels = computed(() => state.value?.tunnels ?? []);
 const totalLogs = computed(() => (state.value?.logs ?? []).length);
 const visibleLogs = computed(() => {
-  const all = state.value?.logs ?? [];
+  const all = (state.value?.logs ?? []).filter(line => line.toLowerCase().includes(logQuery.value.toLowerCase()));
   const n = logLimit.value;
   if (n <= 0 || n >= all.length) return all;
   return all.slice(all.length - n);
@@ -145,10 +175,11 @@ const hasTunnelToken = computed(() => !!state.value?.has_tunnel_token);
 const tunnelTokenPath = computed(() => state.value?.tunnel_token_path ?? "");
 const tokenPath = computed(() => state.value?.cf_token_path ?? "");
 
+watch(() => form.value.scheme, value => { if (value !== 'https') { form.value.origin.http2Origin = false; form.value.noTlsVerify = false; } });
 watch(logText, async () => {
   await nextTick();
   const el = logEl.value;
-  if (el) el.scrollTop = el.scrollHeight;
+  if (el && followLogs.value) el.scrollTop = el.scrollHeight;
 });
 
 const filtered = computed(() => {
@@ -177,6 +208,7 @@ function toPayload(r: Rule): RuleInput {
     noTlsVerify: r.noTlsVerify,
     enabled: r.enabled,
     note: r.note,
+    origin: r.origin,
   };
 }
 
@@ -190,6 +222,7 @@ function resetForm() {
     port: "",
     host: "127.0.0.1",
     scheme: "http",
+    origin: defaultOrigin(),
     noTlsVerify: false,
     enabled: true,
     note: "",
@@ -213,6 +246,7 @@ function openEdit(r: Rule) {
     noTlsVerify: r.noTlsVerify,
     enabled: r.enabled,
     note: r.note || "",
+    origin: {...(r.origin || defaultOrigin())},
   };
   scanned.value = [];
   showForm.value = true;
@@ -221,8 +255,8 @@ function openEdit(r: Rule) {
 async function submitForm() {
   const h = form.value.hostname.trim().toLowerCase();
   const p = Number(form.value.port);
-  if (!h || !p) {
-    notify("域名和端口都要填", true);
+  if (!h || !Number.isInteger(p) || p < 1 || p > 65535) {
+    notify("请填写域名和 1–65535 的整数端口", true);
     return;
   }
   const clash = rules.value.some((r) => r.hostname === h && r.hostname !== editing.value);
@@ -238,6 +272,7 @@ async function submitForm() {
     noTlsVerify: form.value.noTlsVerify,
     enabled: form.value.enabled,
     note: form.value.note.trim(),
+    origin: {...form.value.origin},
   };
   const isEdit = !!editing.value;
   await guard(async () => {
@@ -293,6 +328,7 @@ async function remove(hostname: string) {
   await guard(async () => {
     await pushRules(next);
     await api.save();
+    pendingDelete.value = "";
   }, "已删除 " + hostname);
 }
 
@@ -408,69 +444,6 @@ async function clearToken() {
   }
 }
 
-function fmtSize(kb: number): string {
-  if (!kb) return "-";
-  const gb = kb / 1024 / 1024;
-  return gb >= 1 ? gb.toFixed(1) + " GB" : Math.round(kb / 1024) + " MB";
-}
-
-function fmtRate(bps: number): string {
-  if (!bps || bps < 1) return "0 B/s";
-  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
-  let v = bps;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return v.toFixed(v >= 10 ? 0 : 1) + " " + units[i];
-}
-
-function fmtUptime(secs: number): string {
-  if (!secs) return "-";
-  const d = Math.floor(secs / 86400);
-  const h = Math.floor((secs % 86400) / 3600);
-  const m = Math.floor((secs % 3600) / 60);
-  if (d > 0) return d + " 天 " + h + " 小时";
-  if (h > 0) return h + " 小时 " + m + " 分";
-  return m + " 分";
-}
-
-function pctOf(used: number, total: number): number {
-  if (!total) return 0;
-  return Math.min(100, Math.max(0, Math.round((used / total) * 100)));
-}
-
-const memPct = computed(() => {
-  const m = met.value;
-  if (!m || !m.mem_total_kb) return 0;
-  return pctOf(m.mem_total_kb - m.mem_avail_kb, m.mem_total_kb);
-});
-const diskPct = computed(() => {
-  const m = met.value;
-  if (!m || !m.disk_total_kb) return 0;
-  return pctOf(m.disk_used_kb, m.disk_total_kb);
-});
-// Linux 才有 /proc; Windows 桌面端采不到, 不能显示成 0 装作正常
-const metricsSupported = computed(() => {
-  const m = met.value;
-  return !!m && m.mem_total_kb > 0;
-});
-
-const cpuSpark = computed(() => {
-  const h = cpuHist.value;
-  if (h.length < 2) return "";
-  const w = 240;
-  const ht = 40;
-  return h
-    .map((v, i) => {
-      const x = (i / (h.length - 1)) * w;
-      const y = ht - (Math.min(100, Math.max(0, v)) / 100) * ht;
-      return x.toFixed(1) + "," + y.toFixed(1);
-    })
-    .join(" ");
-});
-
 const filterOptions: { key: FilterKind; label: string }[] = [
   { key: "all", label: "全部" },
   { key: "up", label: "通" },
@@ -481,19 +454,16 @@ const filterOptions: { key: FilterKind; label: string }[] = [
 </script>
 
 <template>
-  <div class="min-h-full bg-background pb-10 text-foreground">
-    <header class="sticky top-0 z-10 border-b bg-card/85 backdrop-blur">
-      <div class="mx-auto flex h-14 max-w-5xl items-center gap-2 px-3 md:gap-3 md:px-6">
-        <h1 class="text-base font-semibold">内网穿透面板</h1>
-        <Badge :variant="running ? 'success' : state?.external ? 'warning' : 'muted'">
+  <div class="panel-shell min-h-full text-foreground">
+    <header class="panel-header sticky top-0 z-10 border-b bg-card/85 backdrop-blur-xl">
+      <div class="mx-auto flex h-14 max-w-[1400px] items-center gap-2 px-3 md:gap-3 md:px-6">
+        <div class="brand-mark"><Network class="h-5 w-5" /></div><h1 class="whitespace-nowrap text-sm font-semibold tracking-tight">Tunnel Panel<span class="hidden pl-2 text-xs font-normal text-muted-foreground sm:inline">连接控制台</span></h1>
+        <Badge class="hidden sm:inline-flex" :variant="running ? 'success' : state?.external ? 'warning' : 'muted'">
           {{ running ? "● 运行中" : state?.external ? "● 外部进程" : "● 已停止" }}
         </Badge>
         <span v-if="state?.conn" class="hidden text-xs text-muted-foreground sm:inline">{{ state.conn }}</span>
         <div class="flex-1" />
-        <Button variant="ghost" size="sm" :title="theme === 'dark' ? '切到浅色' : '切到深色'" @click="toggleTheme">
-          <Sun v-if="theme === 'dark'" class="h-4 w-4" />
-          <Moon v-else class="h-4 w-4" />
-        </Button>
+        <ThemePicker />
         <Button variant="ghost" size="sm" @click="api.logout()">
           <LogOut class="h-4 w-4" />
           退出
@@ -501,9 +471,28 @@ const filterOptions: { key: FilterKind; label: string }[] = [
       </div>
     </header>
 
-    <main class="mx-auto max-w-5xl space-y-4 px-3 pt-4 md:px-6 md:pt-5">
-      <Card>
-        <div class="p-6 pb-3 text-base font-semibold leading-none tracking-tight">操作</div>
+    <div class="workspace-layout">
+    <nav class="workspace-nav" aria-label="主导航">
+      <div class="eyebrow hidden px-3 pb-4 lg:block">WORKSPACE</div>
+      <button v-for="item in sections" :key="item.id" type="button" :class="{active: section === item.id}" :aria-label="item.label" :aria-current="section === item.id ? 'page' : undefined" @click="section = item.id"><component :is="item.icon" class="h-4 w-4 shrink-0" /><span class="hidden md:inline">{{ item.label }}</span><span class="md:hidden">{{ item.short }}</span><span v-if="item.id === 'routes'" class="nav-count">{{ rules.length }}</span></button>
+      <div class="nav-footer"><span class="status-dot" :class="running ? 'online' : ''" />{{ running ? '连接器运行中' : '连接器未运行' }}<p class="mt-2 text-xs text-muted-foreground">{{ hasTunnelToken ? '远程管理模式' : '本地管理模式' }}</p></div>
+    </nav>
+    <main class="workspace-main">
+      <div class="page-heading"><div><div class="eyebrow">YOUR CONNECTION SPACE</div><h1>{{ currentSection.label }}</h1><p>{{ currentSection.subtitle }}</p></div><div class="flex shrink-0 gap-2"><Button variant="outline" class="px-3" aria-label="访问诊断" @click="showDiagnostics = true"><Activity class="h-4 w-4" /><span class="hidden sm:inline">访问</span>诊断</Button><Button variant="outline" class="px-3" @click="refresh"><RefreshCw class="h-4 w-4" /><span class="hidden sm:inline">刷新</span></Button></div></div>
+      <div v-if="refreshError" class="info-strip" role="alert">{{ refreshError }}</div>
+      <div v-if="state?.tunnels_error" class="info-strip" role="status">{{ state.tunnels_error }}（保留上次列表）</div>
+      <div v-if="!state && !refreshError" class="info-strip" role="status">正在加载隧道配置…</div>
+      <PerformanceOverview v-if="section === 'routes'" :metrics="met" :history="cpuHist" :error="metricsError" />
+      <MonitoringCenter v-if="section === 'metrics'" @notice="notify" />
+      <div v-if="section === 'routes'" class="summary-grid">
+        <div><span>连接状态</span><strong>{{ running ? '运行中' : state?.external ? '外部进程' : '已停止' }}</strong><small>{{ state?.conn || '等待连接器事件' }}</small></div>
+        <div><span>转发服务</span><strong>{{ rules.filter(r => r.enabled).length }}<em> / {{ rules.length }}</em></strong><small>已启用 / 全部规则</small></div>
+        <div><span>源站连通</span><strong>{{ rules.filter(r => r.port_open).length }}<em> 个</em></strong><small>本机 TCP 端口检测</small></div>
+      </div>
+      <ConnectionSettings v-if="section === 'connection' && state" :key="state.config_path" :settings="state.connection" :running="running" :remote="hasTunnelToken" @saved="refresh" @notice="notify" />
+      <ApiToolkit v-if="section === 'api'" v-model:hostname="apiHostname" :rules="rules" :has-token="hasToken" @notice="notify" @token="showToken = true" />
+      <Card v-if="section === 'routes'">
+        <div class="p-6 pb-3 text-base font-semibold leading-none tracking-tight">连接器控制</div>
         <div class="space-y-3 p-6 pt-0">
           <div class="flex flex-wrap gap-2">
             <Button :disabled="busy" @click="guard(() => api.save().then(() => undefined), '已保存并校验')">
@@ -545,25 +534,14 @@ const filterOptions: { key: FilterKind; label: string }[] = [
         </div>
       </Card>
 
-      <Card>
+      <Card v-if="section === 'routes'">
         <div class="p-6 pb-3 text-base font-semibold leading-none tracking-tight">隧道</div>
         <div class="space-y-2 p-6 pt-0">
-          <div class="flex items-end gap-2">
-            <div class="max-w-sm flex-1 space-y-1.5">
+          <div class="flex flex-wrap items-end gap-2">
+            <div class="min-w-[200px] flex-1 space-y-1.5">
               <Label for="tunnel">选择隧道</Label>
               <div class="relative">
-                <select
-                  id="tunnel"
-                  :value="state?.tunnel ?? ''"
-                  class="h-9 w-full appearance-none rounded-md border border-input bg-background pl-3 pr-9 text-sm shadow-sm transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                  @change="(e) => guard(() => api.setTunnel((e.target as HTMLSelectElement).value).then(() => undefined), '已切换隧道')"
-                >
-                  <option v-if="tunnels.length === 0" :value="state?.tunnel ?? ''">
-                    {{ state?.tunnel || "（无可用隧道）" }}
-                  </option>
-                  <option v-for="t in tunnels" :key="t.id" :value="t.id">{{ t.name }}</option>
-                </select>
-                <ChevronDown class="pointer-events-none absolute right-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                <Select id="tunnel" label="选择隧道（运行时请先停止）" :disabled="busy || running" :model-value="state?.tunnel ?? ''" :options="tunnels.length ? tunnels.map(t => ({value:t.id,label:t.name})) : [{value:state?.tunnel ?? '',label:state?.tunnel || '无可用隧道'}]" @update:model-value="value => guard(() => api.setTunnel(value).then(() => undefined), '已切换隧道')" />
               </div>
             </div>
             <Button variant="outline" @click="showTunnelToken = true">
@@ -576,93 +554,19 @@ const filterOptions: { key: FilterKind; label: string }[] = [
               添加转发规则
             </Button>
           </div>
-          <p class="text-xs text-muted-foreground">{{ state?.config_path }}</p>
+          <p class="break-all font-mono text-xs text-muted-foreground">{{ state?.config_path }}</p><div v-if="hasTunnelToken" class="info-strip">远程管理：本页转发规则仅保存在本地，实际转发以 Cloudflare 后台为准。</div>
         </div>
       </Card>
 
-      <Card>
-        <div class="flex flex-wrap items-center gap-2 p-6 pb-3">
-          <div class="text-base font-semibold leading-none tracking-tight">性能</div>
-          <span class="text-xs text-muted-foreground">
-            {{ metricsSupported ? met!.cores + " 核 · 已运行 " + fmtUptime(met!.uptime_secs) : met ? "本机不可采集" : "采集中…" }}
-          </span>
-          <div class="flex-1" />
-          <span class="text-xs text-muted-foreground">每 3 秒刷新</span>
-        </div>
-        <div v-if="!metricsSupported" class="px-4 pb-4 pt-0 text-xs text-muted-foreground md:px-6 md:pb-6">
-          当前平台不支持采集（性能指标读取的是 Linux 的 /proc；Windows 桌面端请在服务器上查看）
-        </div>
-        <div v-else class="grid grid-cols-1 gap-3 px-4 pb-4 pt-0 sm:grid-cols-2 md:px-6 md:pb-6">
-          <div class="rounded-lg border p-3">
-            <div class="flex items-center justify-between text-xs">
-              <span class="font-medium">CPU</span>
-              <span class="tabular-nums text-muted-foreground">{{ met ? Math.round(met.cpu_pct) + "%" : "-" }}</span>
-            </div>
-            <div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-              <div
-                class="h-full rounded-full bg-primary transition-all"
-                :style="{ width: (met ? met.cpu_pct : 0) + '%' }"
-              />
-            </div>
-            <svg viewBox="0 0 240 40" class="mt-2 h-10 w-full" preserveAspectRatio="none">
-              <polyline :points="cpuSpark" fill="none" stroke="currentColor" stroke-width="1.5" class="text-primary" />
-            </svg>
-          </div>
 
-          <div class="rounded-lg border p-3">
-            <div class="flex items-center justify-between text-xs">
-              <span class="font-medium">内存</span>
-              <span class="tabular-nums text-muted-foreground">
-                {{ met ? fmtSize(met.mem_total_kb - met.mem_avail_kb) + " / " + fmtSize(met.mem_total_kb) : "-" }}
-              </span>
-            </div>
-            <div class="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-              <div class="h-full rounded-full bg-emerald-500 transition-all" :style="{ width: memPct + '%' }" />
-            </div>
-            <div class="mt-2 flex items-center justify-between text-xs text-muted-foreground">
-              <span>磁盘</span>
-              <span class="tabular-nums">
-                {{ met ? fmtSize(met.disk_used_kb) + " / " + fmtSize(met.disk_total_kb) : "-" }}
-              </span>
-            </div>
-            <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-              <div class="h-full rounded-full bg-amber-500 transition-all" :style="{ width: diskPct + '%' }" />
-            </div>
-          </div>
-
-          <div class="rounded-lg border p-3 text-xs sm:col-span-2">
-            <div class="grid grid-cols-2 gap-x-6 gap-y-1.5 sm:grid-cols-4">
-              <div class="flex items-center justify-between gap-2">
-                <span class="text-muted-foreground">负载 1/5/15</span>
-                <span class="tabular-nums">
-                  {{ met && met.load1 >= 0 ? met.load1.toFixed(2) + " / " + met.load5.toFixed(2) + " / " + met.load15.toFixed(2) : "-" }}
-                </span>
-              </div>
-              <div class="flex items-center justify-between gap-2">
-                <span class="text-muted-foreground">下行</span>
-                <span class="tabular-nums">{{ met ? fmtRate(met.rx_bps) : "-" }}</span>
-              </div>
-              <div class="flex items-center justify-between gap-2">
-                <span class="text-muted-foreground">上行</span>
-                <span class="tabular-nums">{{ met ? fmtRate(met.tx_bps) : "-" }}</span>
-              </div>
-              <div class="flex items-center justify-between gap-2">
-                <span class="text-muted-foreground">面板占用</span>
-                <span class="tabular-nums">{{ met ? fmtSize(met.panel_rss_kb) : "-" }}</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      </Card>
-
-      <Card>
+      <Card v-if="section === 'routes'">
         <div class="flex flex-wrap items-center gap-2 p-6 pb-3">
           <div class="text-base font-semibold leading-none tracking-tight">转发规则</div>
           <span class="text-xs text-muted-foreground">{{ filtered.length }} / {{ rules.length }} 条</span>
           <div class="flex-1" />
           <div class="relative">
             <Search class="pointer-events-none absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
-            <Input v-model="query" class="w-56 pl-8" placeholder="搜索域名 / 目标 / 备注" />
+            <Input v-model="query" class="w-full sm:w-64 pl-8" placeholder="搜索域名 / 目标 / 备注" />
           </div>
         </div>
         <div class="space-y-3 px-6 pb-6 pt-0">
@@ -687,7 +591,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                 <th class="h-9 px-2 text-left align-middle text-xs font-medium text-muted-foreground">转发目标</th>
                 <th class="h-9 w-16 px-2 text-left align-middle text-xs font-medium text-muted-foreground">检测</th>
                 <th class="h-9 w-20 px-2 text-left align-middle text-xs font-medium text-muted-foreground">状态</th>
-                <th class="h-9 w-44 px-2 text-left align-middle text-xs font-medium text-muted-foreground">操作</th>
+                <th class="h-9 w-64 px-2 text-left align-middle text-xs font-medium text-muted-foreground">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -747,7 +651,8 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                   </button>
                 </td>
                 <td class="px-2 py-2.5 align-middle">
-                  <div class="flex gap-1">
+                  <div class="flex flex-wrap gap-1">
+                    <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的 API 与流式配置'" title="配置此域名的 API / 流式规则" @click="openApi(r.hostname)"><SlidersHorizontal class="h-3.5 w-3.5" /><span>API / 流式</span></Button>
                     <Button variant="outline" size="icon" title="编辑" @click="openEdit(r)">
                       <Pencil class="h-3.5 w-3.5" />
                     </Button>
@@ -757,7 +662,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                     <Button variant="outline" size="icon" title="下移" @click="move(rules.findIndex((x) => x.hostname === r.hostname), 1)">
                       <ArrowDown class="h-3.5 w-3.5" />
                     </Button>
-                    <Button variant="outline" size="icon" title="删除" @click="remove(r.hostname)">
+                    <Button variant="outline" size="icon" title="删除" @click="pendingDelete = r.hostname">
                       <Trash2 class="h-3.5 w-3.5 text-red-600" />
                     </Button>
                   </div>
@@ -810,7 +715,8 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                   {{ r.enabled ? "已启用" : "已禁用" }}
                 </button>
                 <div class="flex-1" />
-                <Button variant="outline" size="icon" title="编辑" @click="openEdit(r)">
+                <Button variant="outline" size="sm" :aria-label="r.hostname + ' 的 API 与流式配置'" title="配置此域名的 API / 流式规则" @click="openApi(r.hostname)"><SlidersHorizontal class="h-3.5 w-3.5" /><span>API / 流式</span></Button>
+                    <Button variant="outline" size="icon" title="编辑" @click="openEdit(r)">
                   <Pencil class="h-3.5 w-3.5" />
                 </Button>
                 <Button variant="outline" size="icon" title="上移" @click="move(rules.findIndex((x) => x.hostname === r.hostname), -1)">
@@ -819,7 +725,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
                 <Button variant="outline" size="icon" title="下移" @click="move(rules.findIndex((x) => x.hostname === r.hostname), 1)">
                   <ArrowDown class="h-3.5 w-3.5" />
                 </Button>
-                <Button variant="outline" size="icon" title="删除" @click="remove(r.hostname)">
+                <Button variant="outline" size="icon" title="删除" @click="pendingDelete = r.hostname">
                   <Trash2 class="h-3.5 w-3.5 text-red-600" />
                 </Button>
               </div>
@@ -828,33 +734,24 @@ const filterOptions: { key: FilterKind; label: string }[] = [
         </div>
       </Card>
 
-      <Card>
+      <Card v-if="section === 'logs'">
         <div class="flex flex-wrap items-center gap-2 p-6 pb-3">
           <div class="text-base font-semibold leading-none tracking-tight">日志</div>
           <span class="text-xs text-muted-foreground">共 {{ totalLogs }} 条, 显示最近 {{ visibleLogs.length }} 条</span>
           <div class="flex-1" />
           <div class="relative">
-            <select
-              v-model.number="logLimit"
-              class="h-8 appearance-none rounded-md border border-input bg-background pl-2 pr-7 text-xs transition-colors hover:bg-accent"
-            >
-              <option :value="50">50 条</option>
-              <option :value="100">100 条</option>
-              <option :value="200">200 条</option>
-              <option :value="0">全部</option>
-            </select>
-            <ChevronDown class="pointer-events-none absolute right-1.5 top-2 h-3.5 w-3.5 text-muted-foreground" />
+            <Select v-model="logLimit" label="日志条数" :options="[{value:50,label:'50 条'},{value:100,label:'100 条'},{value:200,label:'200 条'},{value:0,label:'全部'}]" />
           </div>
         </div>
         <div class="p-6 pt-0">
-          <pre ref="logEl" class="h-40 overflow-auto rounded-lg bg-slate-900 p-3 text-xs leading-relaxed text-slate-200 md:h-52">{{ logText }}</pre>
+          <div class="mb-3 flex flex-wrap items-center gap-3"><Input v-model="logQuery" class="max-w-sm" placeholder="搜索日志关键字…" /><Switch v-model="followLogs" label="自动滚动" /></div>
+          <pre ref="logEl" class="h-40 overflow-auto rounded-lg bg-muted/50 p-4 text-xs leading-relaxed text-foreground md:h-[480px]">{{ logText || "暂无匹配日志，启动隧道后可在此查看连接事件。" }}</pre>
         </div>
       </Card>
     </main>
+    </div>
 
-    <Transition name="pop">
-      <div v-if="showForm" class="fixed inset-0 z-20 flex items-center justify-center bg-black/40 p-4">
-        <div class="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-4 shadow-xl md:p-6">
+    <Modal v-model="showForm" label="转发规则" :busy="busy">
           <div class="mb-4 flex items-center justify-between">
             <div class="text-base font-semibold">{{ editing ? "编辑转发规则" : "添加转发规则" }}</div>
             <button class="text-muted-foreground hover:text-foreground" @click="showForm = false">
@@ -884,28 +781,14 @@ const filterOptions: { key: FilterKind; label: string }[] = [
               <div class="space-y-1.5">
                 <Label for="f-scheme">协议</Label>
                 <div class="relative">
-                  <select
-                    id="f-scheme"
-                    v-model="form.scheme"
-                    class="h-9 w-full appearance-none rounded-md border border-input bg-background pl-3 pr-9 text-sm transition-colors hover:bg-accent"
-                  >
-                    <option value="http">http</option>
-                    <option value="https">https</option>
-                  </select>
-                  <ChevronDown class="pointer-events-none absolute right-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Select id="f-scheme" label="源站协议" v-model="form.scheme" :options="[{value:'http',label:'HTTP'},{value:'https',label:'HTTPS'}]" />
                 </div>
               </div>
-              <div class="flex flex-col justify-end gap-2 pb-1 text-xs">
-                <label class="flex items-center gap-2">
-                  <input v-model="form.noTlsVerify" type="checkbox" />
-                  忽略源站证书
-                </label>
-                <label class="flex items-center gap-2">
-                  <input v-model="form.enabled" type="checkbox" />
-                  启用
-                </label>
-              </div>
+              <div class="flex items-end"><Switch v-model="form.enabled" label="启用规则" /></div>
             </div>
+            <Switch v-model="form.noTlsVerify" label="跳过源站证书校验" description="仅适用于受控的自签名 HTTPS 源站；默认校验证书。" :disabled="form.scheme !== 'https'" />
+            <details class="advanced-section"><summary>源站连接与流式设置<span>超时 · HTTP/2 · 连接复用</span></summary><div class="pt-4"><OriginFields v-model="form.origin" :scheme="form.scheme" /></div></details>
+            <div v-if="hasTunnelToken" class="info-strip">远程管理模式：本地规则不会应用到云端，请在 Cloudflare 后台配置转发。</div>
 
             <div class="rounded-md border p-3">
               <div class="mb-2 flex flex-wrap items-center gap-2">
@@ -936,13 +819,13 @@ const filterOptions: { key: FilterKind; label: string }[] = [
               <Button type="submit" :disabled="busy">{{ editing ? "保存修改" : "添加" }}</Button>
             </div>
           </form>
-        </div>
-      </div>
-    </Transition>
+    </Modal>
 
-    <Transition name="pop">
-      <div v-if="showTunnelToken" class="fixed inset-0 z-20 flex items-center justify-center bg-black/40 p-4">
-        <div class="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-4 shadow-xl md:p-6">
+    <Modal v-model="showDiagnostics" label="访问诊断">
+      <AccessDiagnostics v-if="showDiagnostics" :rules="rules" :running="running" :external="!!state?.external" :connection="state?.connection ?? {protocol:'http2', 'edge-ip-version':'4', region:'', loglevel:'info'}" @changed="refresh" @close="showDiagnostics = false" @settings="showDiagnostics = false; section = 'connection'" @api="showDiagnostics = false; section = 'api'" />
+    </Modal>
+
+    <Modal v-model="showTunnelToken" label="隧道 Token" :busy="tunnelTokenBusy">
           <div class="mb-4 flex items-center justify-between">
             <div class="text-base font-semibold">隧道 Token</div>
             <button class="text-muted-foreground hover:text-foreground" @click="showTunnelToken = false">
@@ -975,13 +858,9 @@ const filterOptions: { key: FilterKind; label: string }[] = [
               <Button type="button" :disabled="tunnelTokenBusy" @click="saveTunnelToken">保存</Button>
             </div>
           </div>
-        </div>
-      </div>
-    </Transition>
+    </Modal>
 
-    <Transition name="pop">
-      <div v-if="showToken" class="fixed inset-0 z-20 flex items-center justify-center bg-black/40 p-4">
-        <div class="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-4 shadow-xl md:p-6">
+    <Modal v-model="showToken" label="Cloudflare API Token" :busy="tokenBusy">
           <div class="mb-4 flex items-center justify-between">
             <div class="text-base font-semibold">Cloudflare API Token</div>
             <button class="text-muted-foreground hover:text-foreground" @click="showToken = false">
@@ -991,7 +870,7 @@ const filterOptions: { key: FilterKind; label: string }[] = [
           <div class="space-y-3">
             <div class="flex items-center gap-2 text-sm">
               <Badge :variant="hasToken ? 'success' : 'muted'">{{ hasToken ? "已配置" : "未配置" }}</Badge>
-              <span class="text-xs text-muted-foreground">只用于自动写 DNS; 不配置也能正常转发</span>
+              <span class="text-xs text-muted-foreground">用于 DNS、云端设置和缓存规则；按需要授予对应权限</span>
             </div>
             <div class="space-y-1.5">
               <Label for="cf-path">保存位置</Label>
@@ -1005,23 +884,27 @@ const filterOptions: { key: FilterKind; label: string }[] = [
             </div>
             <div class="space-y-1.5">
               <Label for="cf">Token</Label>
-              <Input id="cf" v-model="tokenInput" type="password" placeholder="Zone:DNS:Edit 权限的 Token" />
+              <Input id="cf" v-model="tokenInput" type="password" placeholder="Zone Read；DNS / Zone Settings / Cache Rules 按需授权" />
             </div>
             <div class="flex justify-end gap-2 pt-1">
               <Button variant="outline" type="button" :disabled="tokenBusy || !hasToken" @click="clearToken">清除</Button>
               <Button type="button" :disabled="tokenBusy" @click="saveToken">保存</Button>
             </div>
           </div>
-        </div>
-      </div>
-    </Transition>
+    </Modal>
 
-    <div
-      v-if="toast"
-      class="fixed bottom-5 right-5 z-30 max-w-sm rounded-lg px-4 py-2.5 text-sm text-white shadow-lg"
-      :class="toast.bad ? 'bg-red-600' : 'bg-slate-900'"
-    >
-      {{ toast.text }}
+    <div v-if="pendingDelete" class="fixed inset-0 z-20 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true" aria-label="删除规则">
+      <div class="w-full max-w-md rounded-xl border bg-card p-6 shadow-xl"><h2 class="text-lg font-semibold">删除转发规则？</h2><p class="my-4 break-all text-sm text-muted-foreground">{{ pendingDelete }} 的本地转发配置将被删除。DNS 记录会保留。</p><div class="flex justify-end gap-2"><Button variant="outline" @click="pendingDelete = ''">取消</Button><Button variant="destructive" :disabled="busy" @click="remove(pendingDelete)">删除规则</Button></div></div>
     </div>
+    <Teleport to="body"><div
+      v-if="toast"
+      :role="toast.bad ? 'alert' : 'status'"
+      aria-live="polite"
+      class="panel-toast fixed right-4 z-[100] flex items-start gap-3 max-w-sm rounded-xl px-4 py-2.5 text-sm text-white shadow-lg"
+      :class="toast.bad ? 'bg-red-600' : 'bg-zinc-900'"
+    >
+      <span class="min-w-0 flex-1 break-words">{{ toast.text }}</span>
+      <button type="button" aria-label="关闭通知" class="shrink-0 pt-0.5 text-white/80 hover:text-white" @click="toast = null"><X class="h-4 w-4" /></button>
+    </div></Teleport>
   </div>
 </template>

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import ThemePicker from '@/components/ui/ThemePicker.vue';
 import { ref } from "vue";
 import Button from "@/components/ui/Button.vue";
 import Card from "@/components/ui/Card.vue";
@@ -37,8 +38,9 @@ async function onSubmit() {
 </script>
 
 <template>
-  <div class="flex min-h-full items-center justify-center bg-slate-50 p-6">
-    <Card class="w-[380px]">
+  <div class="flex min-h-full items-center justify-center bg-background p-6">
+    <div class="fixed right-6 top-6"><ThemePicker /></div>
+    <Card class="w-full max-w-[420px]">
       <div class="p-6 pb-3">
         <div class="mb-3 flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10">
           <LockKeyhole class="h-4 w-4 text-primary" />

@@ -26,6 +26,8 @@ pub struct Rule {
     /// 备注, 只存在面板的规则清单里, 不写进 yml
     #[serde(default)]
     pub note: String,
+    #[serde(default)]
+    pub origin: OriginSettings,
 }
 
 fn rule_enabled_default() -> bool {
@@ -40,6 +42,7 @@ impl Rule {
             no_tls_verify: false,
             enabled: true,
             note: String::new(),
+            origin: OriginSettings::default(),
         }
     }
 
@@ -55,6 +58,90 @@ pub fn service_for(port: u16, scheme: &str) -> String {
     format!("{scheme}://127.0.0.1:{port}")
 }
 
+/// Documented cloudflared origin request parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct OriginSettings {
+    pub connect_timeout: String,
+    #[serde(rename = "tlsTimeout")]
+    pub tls_timeout: String,
+    pub tcp_keep_alive: String,
+    pub keep_alive_timeout: String,
+    pub keep_alive_connections: u32,
+    pub http2_origin: bool,
+    pub disable_chunked_encoding: bool,
+    pub http_host_header: String,
+    pub origin_server_name: String,
+}
+
+impl Default for OriginSettings {
+    fn default() -> Self {
+        Self { connect_timeout: "30s".into(), tls_timeout: "10s".into(),
+            tcp_keep_alive: "30s".into(), keep_alive_timeout: "1m30s".into(),
+            keep_alive_connections: 100, http2_origin: false,
+            disable_chunked_encoding: false, http_host_header: String::new(),
+            origin_server_name: String::new() }
+    }
+}
+
+fn valid_duration(value: &str) -> bool {
+    // Accept bounded integer seconds/minutes/hours, including Go's 1m30s form.
+    let mut digits = String::new();
+    let mut total: u64 = 0;
+    for ch in value.chars() {
+        if ch.is_ascii_digit() { digits.push(ch); continue; }
+        let multiplier = match ch { 's' => 1, 'm' => 60, 'h' => 3600, _ => return false };
+        let Ok(n) = digits.parse::<u64>() else { return false; };
+        let Some(next) = n.checked_mul(multiplier).and_then(|v| total.checked_add(v)) else { return false; };
+        total = next;
+        digits.clear();
+    }
+    digits.is_empty() && total > 0 && total <= 86400
+}
+
+impl OriginSettings {
+    pub fn validate(&self, service: &str) -> Result<(), String> {
+        for value in [&self.connect_timeout, &self.tls_timeout, &self.tcp_keep_alive, &self.keep_alive_timeout] {
+            if !valid_duration(value) { return Err("超时必须是 1s–24h 范围的时长，例如 30s、1m30s".into()); }
+        }
+        if self.keep_alive_connections > 10000 { return Err("空闲连接数不能超过 10000".into()); }
+        if self.http2_origin && !service.starts_with("https://") { return Err("HTTP/2 源站需要使用 HTTPS".into()); }
+        for value in [&self.http_host_header, &self.origin_server_name] {
+            if value.len() > 255 || value.chars().any(char::is_control) { return Err("Host / TLS 名称不合法".into()); }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ConnectionSettings {
+    pub protocol: String,
+    pub edge_ip_version: String,
+    pub region: String,
+    pub loglevel: String,
+}
+
+impl Default for ConnectionSettings {
+    fn default() -> Self {
+        Self { protocol: "http2".into(), edge_ip_version: "4".into(), region: String::new(), loglevel: "info".into() }
+    }
+}
+
+impl ConnectionSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if !["auto", "http2", "quic"].contains(&self.protocol.as_str()) { return Err("连接协议不合法".into()); }
+        if !["auto", "4", "6"].contains(&self.edge_ip_version.as_str()) { return Err("IP 版本不合法".into()); }
+        if !["", "us"].contains(&self.region.as_str()) { return Err("区域仅支持全局或 us，不能指定 apac".into()); }
+        if !["debug", "info", "warn", "error", "fatal"].contains(&self.loglevel.as_str()) { return Err("日志级别不合法".into()); }
+        Ok(())
+    }
+    pub fn args(&self) -> Vec<String> {
+        vec!["--protocol".into(), self.protocol.clone(), "--edge-ip-version".into(), self.edge_ip_version.clone(),
+            "--region".into(), self.region.clone(), "--loglevel".into(), self.loglevel.clone()]
+    }
+}
+
 /// cloudflared 的 yml 配置。
 #[derive(Debug, Clone, Default)]
 pub struct TunnelConfig {
@@ -62,6 +149,7 @@ pub struct TunnelConfig {
     pub tunnel: String,
     pub credentials_file: String,
     pub rules: Vec<Rule>,
+    pub connection: ConnectionSettings,
 }
 
 #[derive(Debug)]
@@ -158,6 +246,13 @@ pub fn read_config(path: &Path) -> Result<TunnelConfig, CoreError> {
     if let Some(c) = value.get("credentials-file").and_then(|v| v.as_str()) {
         cfg.credentials_file = c.to_owned();
     }
+    let mut connection = serde_json::to_value(ConnectionSettings::default()).unwrap();
+    for key in ["protocol", "edge-ip-version", "region", "loglevel"] {
+        if let Some(v) = value.get(key) {
+            connection[key] = serde_json::Value::String(v.as_str().map(str::to_owned).unwrap_or_else(|| v.as_i64().unwrap_or_default().to_string()));
+        }
+    }
+    cfg.connection = serde_json::from_value(connection).map_err(|e| CoreError::Yaml(e.to_string()))?;
     if let Some(list) = value.get("ingress").and_then(|v| v.as_sequence()) {
         for item in list {
             let host = item.get("hostname").and_then(|v| v.as_str());
@@ -166,6 +261,7 @@ pub fn read_config(path: &Path) -> Result<TunnelConfig, CoreError> {
                 let no_tls = item
                     .get("originRequest")
                     .and_then(|v| v.get("noTLSVerify"))
+                    .or_else(|| value.get("originRequest").and_then(|v| v.get("noTLSVerify")))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 let enabled = item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -174,10 +270,18 @@ pub fn read_config(path: &Path) -> Result<TunnelConfig, CoreError> {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_owned();
+                let mut origin = serde_json::to_value(OriginSettings::default()).unwrap();
+                for source in [value.get("originRequest"), item.get("originRequest")].into_iter().flatten() {
+                    for key in ["connectTimeout", "tlsTimeout", "tcpKeepAlive", "keepAliveTimeout", "keepAliveConnections", "http2Origin", "disableChunkedEncoding", "httpHostHeader", "originServerName"] {
+                        if let Some(v) = source.get(key) { origin[key] = serde_json::to_value(v).unwrap(); }
+                    }
+                }
+                let origin = serde_json::from_value(origin).map_err(|e| CoreError::Yaml(e.to_string()))?;
                 cfg.rules.push(Rule {
                     hostname: h.to_owned(),
                     service: s.to_owned(),
                     no_tls_verify: no_tls,
+                    origin,
                     enabled,
                     note,
                 });
@@ -210,13 +314,15 @@ pub fn render_config(cfg: &TunnelConfig) -> String {
         "credentials-file: {}\n\n",
         yaml_quote(&cfg.credentials_file)
     ));
+    s.push_str(&serde_yaml::to_string(&cfg.connection).unwrap());
     s.push_str("ingress:\n");
     for r in cfg.rules.iter().filter(|r| r.enabled) {
         s.push_str(&format!("  - hostname: {}\n", yaml_quote(&r.hostname)));
         s.push_str(&format!("    service: {}\n", yaml_quote(&r.service)));
-        if r.no_tls_verify {
-            s.push_str("    originRequest:\n      noTLSVerify: true\n");
-        }
+        s.push_str("    originRequest:\n");
+        let origin = serde_yaml::to_string(&r.origin).unwrap();
+        for line in origin.lines() { s.push_str(&format!("      {line}\n")); }
+        s.push_str(&format!("      noTLSVerify: {}\n", r.no_tls_verify));
     }
     s.push_str(&format!("  - service: {CATCH_ALL}\n"));
     s
@@ -252,6 +358,19 @@ pub fn write_config(cfg: &TunnelConfig) -> Result<(), CoreError> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&cfg.path, render_config(cfg))?;
+    Ok(())
+}
+
+/// Update only runtime keys; preserve ingress and any manually configured options.
+pub fn write_connection_settings(path: &Path, settings: &ConnectionSettings) -> Result<(), CoreError> {
+    settings.validate().map_err(CoreError::Yaml)?;
+    let text = if path.exists() { std::fs::read_to_string(path)? } else { String::new() };
+    let mut value: serde_yaml::Value = if text.trim().is_empty() { serde_yaml::Value::Mapping(Default::default()) }
+        else { serde_yaml::from_str(text.trim_start_matches('\u{feff}')).map_err(|e| CoreError::Yaml(e.to_string()))? };
+    let map = value.as_mapping_mut().ok_or_else(|| CoreError::Yaml("配置根节点必须是对象".into()))?;
+    if let serde_yaml::Value::Mapping(next) = serde_yaml::to_value(settings).unwrap() { map.extend(next); }
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::write(path, serde_yaml::to_string(&value).map_err(|e| CoreError::Yaml(e.to_string()))?)?;
     Ok(())
 }
 
@@ -301,7 +420,14 @@ pub struct TunnelInfo {
 }
 
 pub fn list_tunnels(cf: &Path) -> Result<Vec<TunnelInfo>, CoreError> {
-    let out = run_capture(cf, &["tunnel", "list"])?;
+    let mut cmd = Command::new(cf);
+    cmd.args(["tunnel", "list"]).stdout(Stdio::piped()).stderr(Stdio::piped());
+    hidden(&mut cmd);
+    let out = cmd.output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(String::from_utf8_lossy(&out.stderr).trim().to_owned()).into());
+    }
+    let out = String::from_utf8_lossy(&out.stdout);
     let mut rows = Vec::new();
     for line in out.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();
@@ -726,30 +852,19 @@ impl TunnelRunner {
     }
 
     pub fn start(&mut self, cf: &Path, cfg: &Path) -> std::io::Result<()> {
-        // --edge-ip-version 4: 实测本机 IPv6 到 Cloudflare 边缘会超时(2606:4700:...),
-        // 每次失败都要等 10s 再重连, 表现为偶发十几秒卡顿; 强制 IPv4 后尝试次数为 0、零报错。
-        let args = vec![
-            "tunnel".to_string(),
-            "--config".to_string(),
-            cfg.to_string_lossy().into_owned(),
-            "--edge-ip-version".to_string(),
-            "4".to_string(),
-            "run".to_string(),
-        ];
+        let settings = read_config(cfg).map_err(std::io::Error::other)?.connection;
+        settings.validate().map_err(std::io::Error::other)?;
+        let mut args = vec!["tunnel".into(), "--config".into(), cfg.to_string_lossy().into_owned()];
+        args.extend(settings.args());
+        args.push("run".into());
         self.spawn_with(cf, args)
     }
 
-    /// 用连接器 token 运行隧道（不需要 cert.pem / credentials json）。
-    /// 注意: Cloudflare 后台创建的隧道是远程管理的, 转发规则以云端为准。
-    pub fn start_with_token(&mut self, cf: &Path, token: &str) -> std::io::Result<()> {
-        let args = vec![
-            "tunnel".to_string(),
-            "--edge-ip-version".to_string(),
-            "4".to_string(),
-            "run".to_string(),
-            "--token".to_string(),
-            token.trim().to_string(),
-        ];
+    pub fn start_with_token(&mut self, cf: &Path, token: &str, settings: &ConnectionSettings) -> std::io::Result<()> {
+        settings.validate().map_err(std::io::Error::other)?;
+        let mut args = vec!["tunnel".into()];
+        args.extend(settings.args());
+        args.extend(["run".into(), "--token".into(), token.trim().into()]);
         self.spawn_with(cf, args)
     }
 
@@ -908,7 +1023,7 @@ fn cf_call(
         "PATCH" => ureq::patch(url),
         _ => return Err(format!("不支持的方法 {method}")),
     };
-    let req = req.set("Authorization", &format!("Bearer {token}"));
+    let req = req.timeout(std::time::Duration::from_secs(20)).set("Authorization", &format!("Bearer {token}"));
     let resp = match body {
         Some(v) => {
             // ureq 2.x 没有 send_json, 自己序列化并指定 Content-Type
@@ -952,6 +1067,99 @@ pub fn list_zones(token: &str) -> Result<Vec<(String, String)>, String> {
         }
     }
     Ok(out)
+}
+
+pub fn zone_settings(token: &str, hostname: &str) -> Result<serde_json::Value, String> {
+    validate_hostname(hostname)?;
+    let zones = list_zones(token)?;
+    let zone = pick_zone(hostname, &zones).ok_or("域名不在 Token 可见的 Zone 中")?;
+    let result = cf_call("GET", &format!("{CF_API}/zones/{}/settings", zone.0), token, None)?;
+    let mut settings = serde_json::Map::new();
+    for item in result["result"].as_array().ok_or("Cloudflare 未返回设置列表")? {
+        if let Some(id) = item["id"].as_str() {
+            if ["ssl", "always_use_https", "rocket_loader"].contains(&id) {
+                settings.insert(id.into(), serde_json::json!({"value": item["value"], "editable": item["editable"]}));
+            }
+        }
+    }
+    Ok(serde_json::json!({"zone": zone.1, "settings": settings}))
+}
+
+pub fn update_zone_setting(token: &str, hostname: &str, setting: &str, value: &str) -> Result<(), String> {
+    validate_hostname(hostname)?;
+    let valid = match setting {
+        "ssl" => ["strict", "full", "flexible", "off"].contains(&value),
+        "always_use_https" | "rocket_loader" => ["on", "off"].contains(&value),
+        _ => false,
+    };
+    if !valid { return Err("不支持的云端设置或值".into()); }
+    let zones = list_zones(token)?;
+    let zone = pick_zone(hostname, &zones).ok_or("域名不在 Token 可见的 Zone 中")?;
+    let result = cf_call("PATCH", &format!("{CF_API}/zones/{}/settings/{setting}", zone.0), token,
+        Some(serde_json::json!({"value": value})))?;
+    if result["success"] != true { return Err("Cloudflare 未确认保存成功".into()); }
+    Ok(())
+}
+
+pub fn cache_bypass_rule(hostname: &str, prefix: &str) -> Result<serde_json::Value, String> {
+    validate_hostname(hostname)?;
+    if !prefix.starts_with('/') || prefix.len() > 1024 || prefix.chars().any(char::is_control) {
+        return Err("路径前缀必须以 / 开头，且不能包含控制字符".into());
+    }
+    let quote = |s: &str| serde_json::to_string(s).unwrap();
+    let expression = format!("(http.host eq {} and starts_with(http.request.uri.path, {}))", quote(hostname), quote(prefix));
+    let hash = expression.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    Ok(serde_json::json!({"ref": format!("cftp_api_{hash:x}"), "description": format!("Tunnel Panel: bypass {hostname}{prefix}"),
+        "expression": expression, "action": "set_cache_settings", "action_parameters": {"cache": false}, "enabled": true}))
+}
+
+/// Append/update only the panel-owned rule; never replace the zone's entire ruleset.
+pub fn apply_cache_bypass(token: &str, hostname: &str, prefix: &str) -> Result<(), String> {
+    let rule = cache_bypass_rule(hostname, prefix)?;
+    apply_managed_rule(token, hostname, "http_request_cache_settings", rule)
+}
+
+pub fn configuration_rule(hostname: &str, prefix: &str, request: &str, response: &str, rocket: &str) -> Result<serde_json::Value, String> {
+    let base = cache_bypass_rule(hostname, prefix)?;
+    if !["", "standard", "full", "none"].contains(&request)
+        || !["", "standard", "none"].contains(&response)
+        || !["", "on", "off"].contains(&rocket) { return Err("缓冲或 Rocket Loader 设置不合法".into()); }
+    let mut params = serde_json::Map::new();
+    if !request.is_empty() { params.insert("request_body_buffering".into(), request.into()); }
+    if !response.is_empty() { params.insert("response_body_buffering".into(), response.into()); }
+    if !rocket.is_empty() { params.insert("rocket_loader".into(), (rocket == "on").into()); }
+    if params.is_empty() { return Err("至少选择一项云端配置".into()); }
+    Ok(serde_json::json!({"ref":base["ref"].as_str().unwrap().replace("cftp_api_", "cftp_config_"),
+        "description":format!("Tunnel Panel: configuration {hostname}{prefix}"), "expression":base["expression"],
+        "action":"set_config", "action_parameters":params, "enabled":true}))
+}
+
+pub fn apply_configuration_rule(token: &str, hostname: &str, prefix: &str, request: &str, response: &str, rocket: &str) -> Result<(), String> {
+    apply_managed_rule(token, hostname, "http_config_settings", configuration_rule(hostname, prefix, request, response, rocket)?)
+}
+
+fn apply_managed_rule(token: &str, hostname: &str, phase: &str, rule: serde_json::Value) -> Result<(), String> {
+    let zones = list_zones(token)?;
+    let zone = pick_zone(hostname, &zones).ok_or("域名不在 Token 可见的 Zone 中")?;
+    let base = format!("{CF_API}/zones/{}/rulesets", zone.0);
+    let list = cf_call("GET", &base, token, None)?;
+    let sets = list["result"].as_array().ok_or("Cloudflare 未返回规则集")?;
+    let existing = sets.iter().find(|v| v["phase"] == phase && v["kind"] == "zone");
+    let result = if let Some(set) = existing {
+        let id = set["id"].as_str().ok_or("规则集缺少 ID")?;
+        let current = cf_call("GET", &format!("{base}/{id}"), token, None)?;
+        let own = current["result"]["rules"].as_array().and_then(|rules| rules.iter().find(|r| r["ref"] == rule["ref"]));
+        if let Some(own) = own {
+            let rid = own["id"].as_str().ok_or("规则缺少 ID")?;
+            cf_call("PATCH", &format!("{base}/{id}/rules/{rid}"), token, Some(rule))?
+        } else {
+            cf_call("POST", &format!("{base}/{id}/rules"), token, Some(rule))?
+        }
+    } else {
+        cf_call("POST", &base, token, Some(serde_json::json!({"name":"Tunnel Panel API rules", "kind":"zone", "phase":phase, "rules":[rule]})))?
+    };
+    if result["success"] != true { return Err("Cloudflare 未确认规则保存成功".into()); }
+    Ok(())
 }
 
 /// 把 hostname 指向 <tunnel_id>.cfargotunnel.com; 已有记录则更新 content。
@@ -1062,6 +1270,7 @@ pub fn load_profile(tunnel_id: &str, credentials_file: &str) -> TunnelConfig {
             tunnel: tunnel_id.to_owned(),
             credentials_file: credentials_file.to_owned(),
             rules: Vec::new(),
+            connection: ConnectionSettings::default(),
         },
     }
 }
@@ -1167,6 +1376,7 @@ mod tests {
             path: p,
             tunnel: "39a46127-81ed-4e4d-a041-f4ea4378c1bd".into(),
             credentials_file: r"C:\Users\me\.cloudflared\abc.json".into(),
+            connection: ConnectionSettings::default(),
             rules: vec![
                 Rule::new("a.example.com", 3065),
                 Rule::new("b.example.com", 8080),
@@ -1191,6 +1401,132 @@ mod tests {
         let mut cfg = tmp_cfg("catchall");
         cfg.rules.clear();
         assert!(render_config(&cfg).contains(CATCH_ALL));
+    }
+
+    #[test]
+    fn advanced_settings_roundtrip_and_real_validation() {
+        let mut cfg = tmp_cfg("advanced");
+        cfg.connection.protocol = "http2".into();
+        cfg.connection.edge_ip_version = "auto".into();
+        cfg.connection.region = "us".into();
+        cfg.rules[0].service = "https://127.0.0.1:8443".into();
+        cfg.rules[0].origin.http2_origin = true;
+        cfg.rules[0].origin.connect_timeout = "45s".into();
+        cfg.rules[0].origin.keep_alive_connections = 256;
+        cfg.rules[0].origin.http_host_header = "internal.example.com".into();
+        cfg.rules[0].origin.origin_server_name = "internal.example.com".into();
+        cfg.rules[0].no_tls_verify = true;
+        write_config(&cfg).unwrap();
+        let restored = read_config(&cfg.path).unwrap();
+        assert_eq!(restored.connection, cfg.connection);
+        assert_eq!(restored.rules, cfg.rules);
+        if let Some(cf) = find_cloudflared() {
+            let (ok, output) = validate_config(&cf, &cfg.path).unwrap();
+            assert!(ok, "{output}");
+        }
+        std::fs::remove_file(&cfg.path).ok();
+    }
+
+    #[test]
+    fn origin_validation_rejects_invalid_settings() {
+        let mut origin = OriginSettings::default();
+        assert!(origin.validate("http://localhost:80").is_ok());
+        origin.http2_origin = true;
+        assert!(origin.validate("http://localhost:80").is_err());
+        assert!(origin.validate("https://localhost:443").is_ok());
+        for duration in ["0s", "-1s", "garbage", "999999999999999999999999h", "25h", "30"] {
+            origin.connect_timeout = duration.into();
+            assert!(origin.validate("https://localhost:443").is_err(), "{duration}");
+        }
+        assert!(valid_duration("1m30s"));
+        assert!(valid_duration("24h"));
+    }
+
+    #[test]
+    fn http2_default_preserves_explicit_protocols() {
+        assert_eq!(ConnectionSettings::default().protocol, "http2");
+        assert_eq!(serde_json::from_str::<ConnectionSettings>("{}").unwrap().protocol, "http2");
+        assert!(ConnectionSettings::default().args().windows(2).any(|args| args == ["--protocol", "http2"]));
+        let cfg = tmp_cfg("http2-default");
+        assert_eq!(read_config(&cfg.path).unwrap().connection.protocol, "http2");
+        for explicit in [None, Some("auto"), Some("quic"), Some("http2")] {
+            let mut text = "tunnel: test-default\ningress:\n  - service: http_status:404\n".to_string();
+            if let Some(value) = explicit { text.push_str(&format!("protocol: {value}\n")); }
+            std::fs::write(&cfg.path, text).unwrap();
+            let loaded = read_config(&cfg.path).unwrap();
+            assert_eq!(loaded.connection.protocol, explicit.unwrap_or("http2"));
+            write_config(&loaded).unwrap();
+            assert_eq!(read_config(&cfg.path).unwrap().connection.protocol, explicit.unwrap_or("http2"));
+        }
+        std::fs::remove_file(&cfg.path).unwrap();
+    }
+
+    #[test]
+    fn connection_validation_and_launch_arguments() {
+        let mut settings = ConnectionSettings::default();
+        assert!(settings.validate().is_ok());
+        settings.protocol = "http2".into();
+        assert!(settings.args().windows(2).any(|a| a == ["--protocol", "http2"]));
+        settings.region = "apac".into();
+        assert!(settings.validate().is_err());
+        settings.region.clear();
+        settings.edge_ip_version = "5".into();
+        assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_save_preserves_unmanaged_yaml_and_global_origin() {
+        let cfg = tmp_cfg("preserve");
+        std::fs::write(&cfg.path, "tunnel: demo\nmetrics: localhost:9001\noriginRequest:\n  connectTimeout: 42s\n  noTLSVerify: true\ningress:\n  - hostname: api.example.com\n    service: https://localhost:443\n  - service: http_status:404\n").unwrap();
+        let settings = ConnectionSettings { protocol: "http2".into(), ..Default::default() };
+        write_connection_settings(&cfg.path, &settings).unwrap();
+        let text = std::fs::read_to_string(&cfg.path).unwrap();
+        assert!(text.contains("metrics: localhost:9001"));
+        let restored = read_config(&cfg.path).unwrap();
+        assert_eq!(restored.rules[0].origin.connect_timeout, "42s");
+        assert!(restored.rules[0].no_tls_verify);
+        assert_eq!(restored.connection, settings);
+        std::fs::remove_file(&cfg.path).ok();
+    }
+
+    #[test]
+    fn legacy_rules_receive_defaults_and_disabled_rules_keep_options() {
+        let rules: Vec<Rule> = serde_json::from_str(r#"[{"hostname":"a.example.com","service":"http://localhost:8080"}]"#).unwrap();
+        assert_eq!(rules[0].origin, OriginSettings::default());
+        let mut rule = rules[0].clone();
+        rule.enabled = false;
+        rule.origin.connect_timeout = "42s".into();
+        let cfg = tmp_cfg("sidecar-advanced");
+        let path = rules_sidecar(&cfg.path);
+        write_rules_sidecar(&path, &[rule.clone()]).unwrap();
+        assert_eq!(read_rules_sidecar(&path).unwrap(), vec![rule]);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn cache_rule_scope_is_escaped_and_stable() {
+        let rule = cache_bypass_rule("api.example.com", "/hu").unwrap();
+        assert_eq!(rule["action_parameters"]["cache"], false);
+        assert_eq!(rule["expression"], r#"(http.host eq "api.example.com" and starts_with(http.request.uri.path, "/hu"))"#);
+        assert_eq!(rule["ref"], cache_bypass_rule("api.example.com", "/hu").unwrap()["ref"]);
+        assert_ne!(rule["ref"], cache_bypass_rule("api.example.com", "/other").unwrap()["ref"]);
+        assert!(cache_bypass_rule("api.example.com", "api").is_err());
+        assert!(cache_bypass_rule("bad host", "/").is_err());
+        assert!(cache_bypass_rule("api.example.com", "/\n").is_err());
+        assert!(cache_bypass_rule("api.example.com", "/\" or true").unwrap()["expression"].as_str().unwrap().contains("\\\""));
+    }
+
+    #[test]
+    fn buffering_rule_only_emits_selected_supported_parameters() {
+        let rule = configuration_rule("api.example.com", "/hu", "none", "none", "off").unwrap();
+        assert_eq!(rule["action"], "set_config");
+        assert_eq!(rule["action_parameters"], serde_json::json!({"request_body_buffering":"none","response_body_buffering":"none","rocket_loader":false}));
+        let partial = configuration_rule("api.example.com", "/hu", "standard", "", "").unwrap();
+        assert_eq!(partial["action_parameters"].as_object().unwrap().len(), 1);
+        assert_eq!(rule["ref"], partial["ref"]);
+        assert_ne!(rule["ref"], cache_bypass_rule("api.example.com", "/hu").unwrap()["ref"]);
+        assert!(configuration_rule("api.example.com", "/hu", "", "", "").is_err());
+        assert!(configuration_rule("api.example.com", "/hu", "", "full", "").is_err());
     }
 
     #[test]

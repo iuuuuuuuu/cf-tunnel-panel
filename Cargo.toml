@@ -22,7 +22,7 @@ required-features = ["server"]
 [features]
 default = ["tray"]
 tray = ["dep:tray-icon", "dep:muda"]
-server = ["dep:tiny_http", "dep:argon2", "dep:rand"]
+server = ["dep:tiny_http", "dep:argon2", "dep:rand", "dep:chrono", "dep:url"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +34,8 @@ argon2 = { version = "0.5", optional = true }
 rand = { version = "0.8", optional = true }
 tray-icon = { version = "0.25", optional = true }
 muda = { version = "0.20", optional = true }
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock"], optional = true }
+url = { version = "2.5.8", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
