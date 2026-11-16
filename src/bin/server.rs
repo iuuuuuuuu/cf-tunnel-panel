@@ -85,6 +85,8 @@ struct PanelConfig {
     lock_min: u64,
     trust_proxy: bool,
     #[serde(default)]
+    local_no_auth: bool,
+    #[serde(default)]
     active_tunnel_path: Option<PathBuf>,
     #[serde(default)]
     tunnel_paths: HashMap<String, PathBuf>,
@@ -104,6 +106,7 @@ impl Default for PanelConfig {
             window_min: 10,
             lock_min: 15,
             trust_proxy: false,
+            local_no_auth: false,
             active_tunnel_path: None,
             tunnel_paths: HashMap::new(),
         }
@@ -320,6 +323,7 @@ struct State {
     tunnel_list: Mutex<TunnelListCache>,
     monitor: Arc<monitoring::Monitor>,
     external: std::sync::atomic::AtomicBool,
+    local_no_auth: bool,
 }
 
 impl State {
@@ -531,6 +535,7 @@ fn handle(st: &Arc<State>, req: Request) {
     let path = url.split('?').next().unwrap_or("/").to_owned();
     let trust_proxy = st.cfg.lock().unwrap().trust_proxy;
     let ip = client_ip(&req, trust_proxy);
+    let local_no_auth = st.local_no_auth && ip.is_loopback() && st.cfg.lock().unwrap().bind == "127.0.0.1";
 
     // 浏览器会自动请求 favicon, 直接给空响应, 避免日志里刷 404
     if path == "/favicon.ico" {
@@ -586,33 +591,21 @@ fn handle(st: &Arc<State>, req: Request) {
     }
 
     // 其余都要会话
-    let Some(sid) = cookie(&req, "sid") else {
-        if path.starts_with("/api/") {
-            send_json(req, 401, serde_json::json!({"error": "未登录"}));
-        } else {
-            send(
-                req,
-                302,
-                "text/plain; charset=utf-8",
-                b"",
-                vec![hdr("Location", "/login")],
-            );
-        }
-        return;
-    };
-    let Some(csrf) = st.touch_session(&sid) else {
-        if path.starts_with("/api/") {
-            send_json(req, 401, serde_json::json!({"error": "会话已过期"}));
-        } else {
-            send(
-                req,
-                302,
-                "text/plain; charset=utf-8",
-                b"",
-                vec![hdr("Location", "/login")],
-            );
-        }
-        return;
+    let (sid, csrf) = if local_no_auth {
+        // Windows 托盘的本机回环免密：只为当前请求创建短生命周期会话，不落盘、不开放公网。
+        st.create_session()
+    } else {
+        let Some(sid) = cookie(&req, "sid") else {
+            if path.starts_with("/api/") { send_json(req, 401, serde_json::json!({"error": "未登录"})); }
+            else { send(req, 302, "text/plain; charset=utf-8", b"", vec![hdr("Location", "/login")]); }
+            return;
+        };
+        let Some(csrf) = st.touch_session(&sid) else {
+            if path.starts_with("/api/") { send_json(req, 401, serde_json::json!({"error": "会话已过期"})); }
+            else { send(req, 302, "text/plain; charset=utf-8", b"", vec![hdr("Location", "/login")]); }
+            return;
+        };
+        (sid, csrf)
     };
 
     if path == "/" {
@@ -649,7 +642,7 @@ fn handle(st: &Arc<State>, req: Request) {
         let is_write = method != Method::Get;
         if is_write {
             // 写操作必须带匹配的 CSRF 头
-            let ok = req
+            let ok = local_no_auth || req
                 .headers()
                 .iter()
                 .any(|h| h.field.equiv("X-CSRF") && ct_eq(h.value.as_str(), &csrf));
@@ -1432,6 +1425,7 @@ fn main() {
         tunnel_list: Mutex::new(TunnelListCache::default()),
         monitor,
         external: std::sync::atomic::AtomicBool::new(false),
+        local_no_auth: std::env::var("PANEL_LOCAL_NO_AUTH").ok().as_deref() == Some("1") && bind == "127.0.0.1",
     });
 
 

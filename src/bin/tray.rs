@@ -113,6 +113,7 @@ fn ensure_password() -> Option<String> {
         .arg("--set-password")
         .env("PANEL_PASSWORD", &pw)
         .env("PANEL_CONFIG", cfg.to_string_lossy().to_string())
+        .env("PANEL_LOCAL_NO_AUTH", "1")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
